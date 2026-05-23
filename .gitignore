@@ -21,3 +21,9 @@ __pycache__/
 # Kotlin
 build/
 .gradle/
+
+.DS_Store
+data/
+
+setup-spaced-prod-env.sh
+NOTES.md
