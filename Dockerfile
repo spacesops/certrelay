@@ -65,11 +65,12 @@ WORKDIR /src
 # language-binding build artefacts and other noise out of the context.
 COPY . .
 
-# Build two binaries from the workspace:
+# Build three binaries from the workspace:
 #   * certrelay (the relay server itself)
 #   * fabric    (the Fabric client CLI - used by HEALTHCHECK to verify the
 #               relay can actually resolve a subname end-to-end, including
 #               cert-chain decoding and verification)
+#   * monitor   (bootstrap relay health monitor - polls BOOTSTRAP_RELAYS)
 # BuildKit caches the cargo registry and target dir across rebuilds, but
 # nothing from those caches is copied into the runtime image.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
@@ -77,10 +78,12 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,sharing=locked \
     --mount=type=cache,target=/src/target,sharing=locked \
     cargo build --release --locked \
         -p relay --bin certrelay \
+        -p relay --bin monitor \
         -p fabric-resolver --bin fabric \
  && cp /src/target/release/certrelay /usr/local/bin/certrelay \
+ && cp /src/target/release/monitor   /usr/local/bin/monitor \
  && cp /src/target/release/fabric    /usr/local/bin/fabric \
- && strip /usr/local/bin/certrelay /usr/local/bin/fabric
+ && strip /usr/local/bin/certrelay /usr/local/bin/monitor /usr/local/bin/fabric
 
 # ---------------------------------------------------------------------------
 # Stage 2: runtime
@@ -101,12 +104,14 @@ RUN apk add --no-cache \
 
 # Binaries + entrypoint + healthcheck
 COPY --from=builder /usr/local/bin/certrelay /usr/local/bin/certrelay
+COPY --from=builder /usr/local/bin/monitor   /usr/local/bin/monitor
 COPY --from=builder /usr/local/bin/fabric    /usr/local/bin/fabric
 COPY docker-entrypoint.sh   /usr/local/bin/docker-entrypoint.sh
 COPY docker-healthcheck.sh  /usr/local/bin/docker-healthcheck.sh
 RUN chmod +x /usr/local/bin/docker-entrypoint.sh \
              /usr/local/bin/docker-healthcheck.sh \
              /usr/local/bin/certrelay \
+             /usr/local/bin/monitor \
              /usr/local/bin/fabric
 
 # Sensible container-friendly defaults. Every one of these can be overridden
@@ -119,7 +124,9 @@ ENV CERTRELAY_CHAIN=mainnet \
     CERTRELAY_PORT=7778 \
     CERTRELAY_BOOTSTRAP=false \
     CERTRELAY_ANCHOR_REFRESH=300 \
-    RUST_LOG=info
+    RUST_LOG=info \
+    CHECK_INTERVAL=30 \
+    REQUEST_TIMEOUT=15
 
 VOLUME ["/data"]
 EXPOSE 7778/tcp

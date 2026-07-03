@@ -6,7 +6,7 @@
 use clap::Parser;
 use relay::BOOTSTRAP_RELAYS;
 use relay::PeerInfo;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 const DEFAULT_CHECK_INTERVAL_MINS: u64 = 30;
@@ -19,7 +19,8 @@ const DEFAULT_REQUEST_TIMEOUT_SECS: u64 = 15;
     long_about = "Polls each URL listed in BOOTSTRAP_RELAYS with GET /peers on a \
                   fixed interval. Logs when a seed enters or leaves an error state \
                   (unreachable, timeout, empty peer list). Logs peer counts for \
-                  seeds that return a non-empty list."
+                  seeds that return a non-empty list. With --watch-all, also probes \
+                  every peer URL reported by the bootstrap relays (deduplicated)."
 )]
 struct Args {
     /// Minutes to wait between poll loops.
@@ -41,6 +42,10 @@ struct Args {
     /// Log filter passed to env_logger (e.g. info, debug, monitor=debug).
     #[arg(long, env = "RUST_LOG", default_value = "info")]
     rust_log: String,
+
+    /// Also probe every peer URL returned by bootstrap relays (deduplicated).
+    #[arg(long, env = "WATCH_ALL", default_value_t = false)]
+    watch_all: bool,
 }
 
 struct RelayTracker {
@@ -49,8 +54,23 @@ struct RelayTracker {
 }
 
 enum ProbeOutcome {
-    Ok(usize),
+    Ok { count: usize, peers: Vec<PeerInfo> },
     Err(String),
+}
+
+#[derive(Clone, Copy)]
+enum NodeKind {
+    Bootstrap,
+    Discovered,
+}
+
+impl NodeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Bootstrap => "bootstrap",
+            Self::Discovered => "discovered",
+        }
+    }
 }
 
 #[tokio::main]
@@ -71,53 +91,101 @@ async fn main() {
     let mut trackers: HashMap<String, RelayTracker> = HashMap::new();
 
     log::info!(
-        "monitor: watching {} bootstrap relay(s), interval={}min, timeout={}s",
+        "monitor: watching {} bootstrap relay(s), interval={}min, timeout={}s, watch_all={}",
         BOOTSTRAP_RELAYS.len(),
         args.check_interval,
-        args.timeout
+        args.timeout,
+        args.watch_all
     );
 
     loop {
+        let mut discovered_peers: HashSet<String> = HashSet::new();
+
         for &base in BOOTSTRAP_RELAYS {
             let url = peers_url(base);
             let outcome = probe(&client, &url, args.timeout).await;
+            if args.watch_all {
+                collect_discovered_peers(&outcome, &mut discovered_peers);
+            }
+            record_outcome(&mut trackers, NodeKind::Bootstrap, base, outcome);
+        }
 
-            let tracker = trackers.entry(base.to_string()).or_insert(RelayTracker {
-                in_error: false,
-                error_since: None,
-            });
-
-            match outcome {
-                ProbeOutcome::Ok(count) => {
-                    if tracker.in_error {
-                        let down_for = tracker
-                            .error_since
-                            .map(|t| t.elapsed())
-                            .unwrap_or_default();
-                        log::info!(
-                            "{base}: resumed from error state (was down for {:.1}s)",
-                            down_for.as_secs_f64()
-                        );
-                        tracker.in_error = false;
-                        tracker.error_since = None;
-                    }
-                    if count > 0 {
-                        log::info!("{base}: {count} peer(s)");
-                    }
-                }
-                ProbeOutcome::Err(reason) => {
-                    if !tracker.in_error {
-                        log::error!("{base}: entered error state — {reason}");
-                        tracker.in_error = true;
-                        tracker.error_since = Some(Instant::now());
-                    } else {
-                        log::warn!("{base}: still in error state — {reason}");
-                    }
-                }
+        if args.watch_all {
+            let mut peer_urls: Vec<String> = discovered_peers.into_iter().collect();
+            peer_urls.sort();
+            log::debug!("watch-all: probing {} discovered peer(s)", peer_urls.len());
+            for base in peer_urls {
+                let url = peers_url(&base);
+                let outcome = probe(&client, &url, args.timeout).await;
+                record_outcome(&mut trackers, NodeKind::Discovered, &base, outcome);
             }
         }
 
         tokio::time::sleep(check_interval).await;
+    }
+}
+
+fn normalize_url(url: &str) -> String {
+    url.trim_end_matches('/').to_string()
+}
+
+fn is_bootstrap(url: &str) -> bool {
+    let normalized = normalize_url(url);
+    BOOTSTRAP_RELAYS
+        .iter()
+        .any(|seed| normalize_url(seed) == normalized)
+}
+
+fn collect_discovered_peers(outcome: &ProbeOutcome, discovered: &mut HashSet<String>) {
+    let ProbeOutcome::Ok { peers, .. } = outcome else {
+        return;
+    };
+    for peer in peers {
+        if !is_bootstrap(&peer.url) {
+            discovered.insert(normalize_url(&peer.url));
+        }
+    }
+}
+
+fn record_outcome(
+    trackers: &mut HashMap<String, RelayTracker>,
+    kind: NodeKind,
+    base: &str,
+    outcome: ProbeOutcome,
+) {
+    let label = kind.as_str();
+    let tracker = trackers.entry(base.to_string()).or_insert(RelayTracker {
+        in_error: false,
+        error_since: None,
+    });
+
+    match outcome {
+        ProbeOutcome::Ok { count, .. } => {
+            if tracker.in_error {
+                let down_for = tracker
+                    .error_since
+                    .map(|t| t.elapsed())
+                    .unwrap_or_default();
+                log::info!(
+                    "[{label}] {base}: resumed from error state (was down for {:.1}s)",
+                    down_for.as_secs_f64()
+                );
+                tracker.in_error = false;
+                tracker.error_since = None;
+            }
+            if count > 0 {
+                log::info!("[{label}] {base}: {count} peer(s)");
+            }
+        }
+        ProbeOutcome::Err(reason) => {
+            if !tracker.in_error {
+                log::error!("[{label}] {base}: entered error state — {reason}");
+                tracker.in_error = true;
+                tracker.error_since = Some(Instant::now());
+            } else {
+                log::warn!("[{label}] {base}: still in error state — {reason}");
+            }
+        }
     }
 }
 
@@ -153,5 +221,8 @@ async fn probe(client: &reqwest::Client, url: &str, timeout_secs: u64) -> ProbeO
         return ProbeOutcome::Err("empty peer list []".into());
     }
 
-    ProbeOutcome::Ok(peers.len())
+    ProbeOutcome::Ok {
+        count: peers.len(),
+        peers,
+    }
 }
