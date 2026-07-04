@@ -98,7 +98,11 @@ async fn main() {
         args.watch_all
     );
 
+    let loop_separator = loop_separator_line();
+
     loop {
+        log::info!("{loop_separator}");
+
         let mut discovered_peers: HashSet<String> = HashSet::new();
 
         for &base in BOOTSTRAP_RELAYS {
@@ -123,6 +127,15 @@ async fn main() {
 
         tokio::time::sleep(check_interval).await;
     }
+}
+
+fn loop_separator_line() -> String {
+    let width = BOOTSTRAP_RELAYS
+        .iter()
+        .map(|url| format!("[bootstrap] {url}/peers : 999 peer(s)").len())
+        .max()
+        .unwrap_or(80);
+    "=".repeat(width)
 }
 
 fn normalize_url(url: &str) -> String {
