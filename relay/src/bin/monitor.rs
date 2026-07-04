@@ -58,6 +58,12 @@ enum ProbeOutcome {
     Err(String),
 }
 
+impl ProbeOutcome {
+    fn is_ok(&self) -> bool {
+        matches!(self, Self::Ok { .. })
+    }
+}
+
 #[derive(Clone, Copy)]
 enum NodeKind {
     Bootstrap,
@@ -98,21 +104,35 @@ async fn main() {
         args.watch_all
     );
 
-    let loop_separator = loop_separator_line();
+    let mut cycle_summary: Option<String> = None;
 
     loop {
-        log::info!("{loop_separator}");
+        if let Some(ref summary) = cycle_summary {
+            log::info!("{summary}");
+        }
 
         let mut discovered_peers: HashSet<String> = HashSet::new();
+        let mut bootstrap_active = 0;
+        let bootstrap_total = BOOTSTRAP_RELAYS.len();
 
         for &base in BOOTSTRAP_RELAYS {
             let url = peers_url(base);
             let outcome = probe(&client, &url, args.timeout).await;
+            if outcome.is_ok() {
+                bootstrap_active += 1;
+            }
             if args.watch_all {
                 collect_discovered_peers(&outcome, &mut discovered_peers);
             }
             record_outcome(&mut trackers, NodeKind::Bootstrap, base, outcome);
         }
+
+        let mut discovered_active = 0;
+        let discovered_total = if args.watch_all {
+            discovered_peers.len()
+        } else {
+            0
+        };
 
         if args.watch_all {
             let mut peer_urls: Vec<String> = discovered_peers.into_iter().collect();
@@ -121,21 +141,51 @@ async fn main() {
             for base in peer_urls {
                 let url = peers_url(&base);
                 let outcome = probe(&client, &url, args.timeout).await;
+                if outcome.is_ok() {
+                    discovered_active += 1;
+                }
                 record_outcome(&mut trackers, NodeKind::Discovered, &base, outcome);
             }
         }
+
+        cycle_summary = Some(format_loop_summary(
+            bootstrap_active,
+            bootstrap_total,
+            discovered_active,
+            discovered_total,
+            args.watch_all,
+        ));
 
         tokio::time::sleep(check_interval).await;
     }
 }
 
-fn loop_separator_line() -> String {
-    let width = BOOTSTRAP_RELAYS
-        .iter()
-        .map(|url| format!("[bootstrap] {url}/peers : 999 peer(s)").len())
-        .max()
-        .unwrap_or(80);
-    "=".repeat(width)
+fn pct(active: usize, total: usize) -> f64 {
+    if total == 0 {
+        0.0
+    } else {
+        (active as f64 / total as f64) * 100.0
+    }
+}
+
+fn format_loop_summary(
+    bootstrap_active: usize,
+    bootstrap_total: usize,
+    discovered_active: usize,
+    discovered_total: usize,
+    watch_all: bool,
+) -> String {
+    let bootstrap_pct = pct(bootstrap_active, bootstrap_total);
+    let mut line = format!(
+        "====== {bootstrap_active} of {bootstrap_total} bootstrap nodes active {bootstrap_pct:.1}% ======"
+    );
+    if watch_all {
+        let discovered_pct = pct(discovered_active, discovered_total);
+        line.push_str(&format!(
+            " {discovered_active} of {discovered_total} discovered nodes active {discovered_pct:.1}% ======"
+        ));
+    }
+    line
 }
 
 fn normalize_url(url: &str) -> String {
