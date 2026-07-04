@@ -174,7 +174,7 @@ fn record_outcome(
                 tracker.error_since = None;
             }
             if count > 0 {
-                log::info!("[{label}] {base}: {count} peer(s)");
+                log::info!("[{label}] {base}/peers : {count} peer(s)");
             }
         }
         ProbeOutcome::Err(reason) => {
