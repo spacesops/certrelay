@@ -165,13 +165,29 @@ impl SqliteStore {
         let handles: Vec<&str> = entries.iter().map(|e| e.handle.as_str()).collect();
         let existing_zones = Self::get_zones_inner(&conn, &handles)?;
 
+        // seq is a unix-seconds timestamp; reject records claiming a seq more than
+        // 6h in the future (accidental far-future clocks or deliberate freshness
+        // pinning).
+        let max_seq = (now + 6 * 3600) as u64;
+
         // Filter to entries where the incoming zone is better (or new)
         let to_store: Vec<_> = entries
             .into_iter()
             .zip(updates.iter())
-            .filter(|(e, update)| match existing_zones.get(e.handle.as_str()) {
-                Some(existing) => update.zone.is_better_than(existing).unwrap_or(false),
-                None => true,
+            .filter(|(e, update)| {
+                if e.offchain_seq > max_seq || e.delegate_offchain_seq > max_seq {
+                    tracing::warn!(
+                        "{}: rejecting update, seq {} exceeds max {} (>6h in future)",
+                        e.handle,
+                        e.offchain_seq.max(e.delegate_offchain_seq),
+                        max_seq
+                    );
+                    return false;
+                }
+                match existing_zones.get(e.handle.as_str()) {
+                    Some(existing) => update.zone.is_better_than(existing).unwrap_or(false),
+                    None => true,
+                }
             })
             .map(|(e, _)| e)
             .collect();
