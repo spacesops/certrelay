@@ -360,11 +360,22 @@ impl Handler {
     }
 }
 
-/// Check if a wire-format epoch hint is verifiable by a zone.
-/// Only checks height - the root is used by clients, not the relay.
+/// Check whether a client's cached epoch hint lets it verify the served zone
+/// without the relay including the ZK receipt.
+///
+/// libveritas restores a stripped receipt from the client's cache only when the
+/// served commitment's `state_root` matches the cached one (see
+/// `Zone::update_receipt_cache`), so the relay may drop the receipt only when the
+/// roots match. If the client's cached commitment is strictly newer than the one
+/// being served, the client discards the served (older) zone in favor of its
+/// cache and never asks for the receipt, so dropping it is safe there too.
 fn epoch_hint_verifiable_by(hint: &resolver::EpochHint, zone: &Zone) -> bool {
     if let ProvableOption::Exists { value: c } = &zone.commitment {
-        c.onchain.block_height >= hint.height
+        if hint.height > c.onchain.block_height {
+            return true; // client already verified a newer commitment
+        }
+        hint.height == c.onchain.block_height
+            && hint.root == hex::encode(c.onchain.state_root)
     } else {
         false
     }
