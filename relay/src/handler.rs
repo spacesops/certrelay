@@ -374,8 +374,7 @@ fn epoch_hint_verifiable_by(hint: &resolver::EpochHint, zone: &Zone) -> bool {
         if hint.height > c.onchain.block_height {
             return true; // client already verified a newer commitment
         }
-        hint.height == c.onchain.block_height
-            && hint.root == hex::encode(c.onchain.state_root)
+        hint.height == c.onchain.block_height && hint.root == hex::encode(c.onchain.state_root)
     } else {
         false
     }
