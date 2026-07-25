@@ -55,7 +55,7 @@ pub fn setup_handler(state: &ChainState) -> Handler {
 
 /// Replace the handler's Veritas with one built from the current chain state.
 pub fn sync_veritas(handler: &Handler, state: &ChainState) {
-    *handler.veritas.lock().unwrap() = build_veritas(state);
+    *handler.veritas.write().unwrap() = build_veritas(state);
 }
 
 /// Build a QueryContext from the handler's store (mirrors what handler does internally).
@@ -79,11 +79,14 @@ pub async fn start_relay(chain_state: &ChainState) -> (String, Arc<AppState>) {
     handler.dev_mode = true;
     let chain = SpacedClient::mock(mock_chain_proof(chain_state));
 
+    let generous = Quota::per_second(NonZeroU32::new(100).unwrap());
     let rate_config = RateLimitConfig {
-        message: Quota::per_second(NonZeroU32::new(100).unwrap()),
-        query: Quota::per_second(NonZeroU32::new(100).unwrap()),
-        announce: Quota::per_second(NonZeroU32::new(100).unwrap()),
-        peers: Quota::per_second(NonZeroU32::new(100).unwrap()),
+        message: generous,
+        proof: generous,
+        read: generous,
+        announce: generous,
+        sync: generous,
+        poke: generous,
     };
     let state = Arc::new(AppState::with_rate_limits(
         handler,

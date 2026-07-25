@@ -31,25 +31,34 @@ use crate::spaced::SpacedClient;
 pub type IpRateLimiter = RateLimiter<IpAddr, DashMapStateStore<IpAddr>, DefaultClock>;
 
 /// Configuration for rate limits.
+///
+/// Buckets follow the cheap/expensive split: `read` covers indexed lookups,
+/// `proof` covers endpoints that trigger proof generation.
 #[derive(Clone)]
 pub struct RateLimitConfig {
-    /// Quota for /message endpoint
+    /// Quota for /message (client publish intake)
     pub message: Quota,
-    /// Quota for /query and /chain-proof endpoints (both trigger proof generation)
-    pub query: Quota,
-    /// Quota for /announce endpoint
+    /// Quota for /query and /chain-proof (both trigger proof generation)
+    pub proof: Quota,
+    /// Quota for cheap reads: /hints, /reverse, /addrs, /anchors, /peers
+    pub read: Quota,
+    /// Quota for /announce
     pub announce: Quota,
-    /// Quota for /peers endpoint
-    pub peers: Quota,
+    /// Quota for /sync and /sync/summary (pages are the unit)
+    pub sync: Quota,
+    /// Quota for /poke
+    pub poke: Quota,
 }
 
 impl Default for RateLimitConfig {
     fn default() -> Self {
         Self {
-            message: Quota::per_minute(NonZeroU32::new(10).unwrap()),
-            query: Quota::per_minute(NonZeroU32::new(15).unwrap()),
+            message: Quota::per_minute(NonZeroU32::new(60).unwrap()),
+            proof: Quota::per_minute(NonZeroU32::new(30).unwrap()),
+            read: Quota::per_minute(NonZeroU32::new(120).unwrap()),
             announce: Quota::per_minute(NonZeroU32::new(5).unwrap()),
-            peers: Quota::per_minute(NonZeroU32::new(10).unwrap()),
+            sync: Quota::per_minute(NonZeroU32::new(60).unwrap()),
+            poke: Quota::per_minute(NonZeroU32::new(30).unwrap()),
         }
     }
 }
@@ -57,24 +66,62 @@ impl Default for RateLimitConfig {
 /// Rate limiters for each endpoint type.
 pub struct RateLimiters {
     pub message: Arc<IpRateLimiter>,
-    pub query: Arc<IpRateLimiter>,
+    pub proof: Arc<IpRateLimiter>,
+    pub read: Arc<IpRateLimiter>,
     pub announce: Arc<IpRateLimiter>,
-    pub peers: Arc<IpRateLimiter>,
+    pub sync: Arc<IpRateLimiter>,
+    pub poke: Arc<IpRateLimiter>,
 }
 
 impl RateLimiters {
     pub fn new(config: &RateLimitConfig) -> Self {
         Self {
             message: Arc::new(RateLimiter::dashmap(config.message)),
-            query: Arc::new(RateLimiter::dashmap(config.query)),
+            proof: Arc::new(RateLimiter::dashmap(config.proof)),
+            read: Arc::new(RateLimiter::dashmap(config.read)),
             announce: Arc::new(RateLimiter::dashmap(config.announce)),
-            peers: Arc::new(RateLimiter::dashmap(config.peers)),
+            sync: Arc::new(RateLimiter::dashmap(config.sync)),
+            poke: Arc::new(RateLimiter::dashmap(config.poke)),
+        }
+    }
+
+    /// Evict stale per-IP entries; call periodically or the maps grow forever.
+    pub fn cleanup(&self) {
+        for limiter in [
+            &self.message,
+            &self.proof,
+            &self.read,
+            &self.announce,
+            &self.sync,
+            &self.poke,
+        ] {
+            limiter.retain_recent();
+            limiter.shrink_to_fit();
         }
     }
 }
 
 /// Default max message size (512 KB).
 pub const DEFAULT_MAX_MESSAGE_SIZE: usize = 512 * 1024;
+
+/// Connect timeout for outbound requests to peers.
+pub const OUTBOUND_CONNECT_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(3);
+/// Total timeout for outbound requests to peers.
+pub const OUTBOUND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(10);
+/// Max bytes accepted when reading a peer's /peers response.
+pub const MAX_PEERS_RESPONSE_SIZE: usize = 64 * 1024;
+/// Max peer entries processed from a single /peers response.
+pub const MAX_PEERS_PER_RESPONSE: usize = 256;
+
+/// Max rows in one /sync page.
+pub const MAX_SYNC_PAGE_ROWS: usize = 1000;
+/// Soft byte cap for one /sync page (stops adding rows once exceeded).
+pub const MAX_SYNC_PAGE_BYTES: usize = 2 * 1024 * 1024;
+
+/// Concurrent chain-proof generations (global, identity-independent cap).
+pub const PROOF_CONCURRENCY: usize = 6;
+/// Concurrent message verifications (global, identity-independent cap).
+pub const VERIFY_CONCURRENCY: usize = 4;
 
 /// Default bootstrap relay URLs.
 pub const BOOTSTRAP_RELAYS: &[&str] = &[
@@ -99,6 +146,28 @@ pub struct AppState {
     /// HTTP header to read the client IP from (e.g. "x-forwarded-for", "cf-connecting-ip").
     /// If None, uses the socket address directly.
     pub remote_ip_header: Option<String>,
+    /// Accept peers with private/loopback addresses (local development and tests).
+    pub allow_private_peers: bool,
+    /// Signal that new data was stored — wakes the poke-send loop, which
+    /// coalesces bursts into one poke per peer per debounce window.
+    pub poke_dirty: tokio::sync::Notify,
+    /// Queue of peer URLs to sync with soon (fed by validated /poke requests,
+    /// drained by the poke-sync loop with per-peer cooldowns).
+    pub poke_sync_tx: tokio::sync::mpsc::UnboundedSender<String>,
+    /// Receiver half, taken once by the poke-sync loop.
+    pub poke_sync_rx: Mutex<Option<tokio::sync::mpsc::UnboundedReceiver<String>>>,
+    /// Global cap on concurrent proof generation. HTTP handlers try-acquire
+    /// and return 503 when saturated; background sync waits its turn.
+    pub proof_sem: Arc<tokio::sync::Semaphore>,
+    /// Global cap on concurrent message verification (CPU-bound).
+    pub verify_sem: Arc<tokio::sync::Semaphore>,
+    /// Observability counters served by GET /stats.
+    pub stats: crate::stats::Stats,
+    /// Retention policy (storage budget + entitlement) for the admission
+    /// gate and eviction sweep.
+    pub retention: crate::retention::RetentionConfig,
+    /// Approximate recently-queried handles, spared during eviction.
+    pub query_heat: std::sync::Mutex<crate::retention::QueryHeat>,
 }
 
 impl AppState {
@@ -112,17 +181,29 @@ impl AppState {
         peer_config: PeerConfig,
         rate_config: RateLimitConfig,
     ) -> Self {
+        let (poke_sync_tx, poke_sync_rx) = tokio::sync::mpsc::unbounded_channel();
         Self {
             handler,
             chain,
             peers: Mutex::new(PeerTable::new(peer_config)),
             limiters: RateLimiters::new(&rate_config),
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
-            http_client: reqwest::Client::new(),
+            http_client: outbound_client_builder()
+                .build()
+                .expect("failed to build http client"),
             self_url: None,
             capabilities: 0,
             is_bootstrap: false,
             remote_ip_header: None,
+            allow_private_peers: false,
+            poke_dirty: tokio::sync::Notify::new(),
+            poke_sync_tx,
+            poke_sync_rx: Mutex::new(Some(poke_sync_rx)),
+            proof_sem: Arc::new(tokio::sync::Semaphore::new(PROOF_CONCURRENCY)),
+            verify_sem: Arc::new(tokio::sync::Semaphore::new(VERIFY_CONCURRENCY)),
+            stats: crate::stats::Stats::default(),
+            retention: crate::retention::RetentionConfig::default(),
+            query_heat: std::sync::Mutex::new(crate::retention::QueryHeat::default()),
         }
     }
 
@@ -131,6 +212,49 @@ impl AppState {
         self.self_url = Some(url);
         self
     }
+
+    /// Client for contacting a peer URL with the address policy enforced at
+    /// connection time. For DNS-named peers the host is resolved, every
+    /// address checked against the IP policy, and the vetted addresses pinned
+    /// into the client — closing the resolve-then-fetch TOCTOU (DNS
+    /// rebinding). IP-literal peers already passed the syntactic policy, so
+    /// the shared client is used. Errors mean the peer's address is not
+    /// allowed (or unresolvable) and it should not be contacted.
+    pub async fn peer_client(&self, url: &str) -> anyhow::Result<reqwest::Client> {
+        if self.allow_private_peers {
+            return Ok(self.http_client.clone());
+        }
+        crate::peer::validate_peer_url(url, false).map_err(|e| anyhow::anyhow!(e))?;
+        let parsed = url::Url::parse(url)?;
+        match parsed.host() {
+            Some(url::Host::Domain(domain)) => {
+                let port = parsed.port_or_known_default().unwrap_or(443);
+                let addrs: Vec<SocketAddr> =
+                    tokio::net::lookup_host((domain, port)).await?.collect();
+                if addrs.is_empty() {
+                    anyhow::bail!("peer host did not resolve: {}", url);
+                }
+                if !addrs.iter().all(|a| crate::peer::ip_is_public(&a.ip())) {
+                    anyhow::bail!("peer resolves to a disallowed address: {}", url);
+                }
+                Ok(outbound_client_builder()
+                    .resolve_to_addrs(domain, &addrs)
+                    .build()?)
+            }
+            Some(_) => Ok(self.http_client.clone()),
+            None => anyhow::bail!("peer url has no host: {}", url),
+        }
+    }
+}
+
+/// Base builder for all peer-facing clients: bounded timeouts and **no
+/// redirect following** — a 302 from a peer must never steer a request at
+/// internal services (spaced/yuki RPC, cloud metadata).
+fn outbound_client_builder() -> reqwest::ClientBuilder {
+    reqwest::Client::builder()
+        .connect_timeout(OUTBOUND_CONNECT_TIMEOUT)
+        .timeout(OUTBOUND_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
 }
 
 /// Build the router with all routes.
@@ -147,22 +271,28 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/chain-proof", post(handle_chain_proof))
         .route("/reverse", get(handle_reverse))
         .route("/addrs", get(handle_addrs))
+        .route("/sync", get(handle_sync))
+        .route("/sync/summary", get(handle_sync_summary))
+        .route("/poke", post(handle_poke))
+        .route("/health", get(handle_health))
+        .route("/stats", get(handle_stats))
         .layer(cors)
         .with_state(state)
 }
 
 /// Extract the client IP from the configured header, falling back to socket address.
 ///
-/// If `remote_ip_header` is set, reads that header and parses the first IP
-/// (handles comma-separated lists like X-Forwarded-For).
+/// If `remote_ip_header` is set, reads that header and parses the **last** IP.
+/// For append-style headers (X-Forwarded-For) the rightmost entry is the one
+/// written by our own trusted proxy — leftmost entries are client-controlled
+/// and would let anyone rotate fake IPs past the per-IP limits. Single-value
+/// overwrite headers (CF-Connecting-IP) are unaffected.
 fn client_ip(addr: &SocketAddr, headers: &HeaderMap, header_name: &Option<String>) -> IpAddr {
     if let Some(name) = header_name
         && let Some(value) = headers.get(name.as_str()).and_then(|v| v.to_str().ok())
     {
-        // Take the first entry (leftmost = original client for XFF-style headers,
-        // and the only value for single-value headers like CF-Connecting-IP)
-        let first = value.split(',').next().unwrap_or("").trim();
-        if let Ok(ip) = first.parse::<IpAddr>() {
+        let last = value.rsplit(',').next().unwrap_or("").trim();
+        if let Ok(ip) = last.parse::<IpAddr>() {
             return ip;
         }
     }
@@ -172,7 +302,8 @@ fn client_ip(addr: &SocketAddr, headers: &HeaderMap, header_name: &Option<String
 /// POST /message - Receive and process a certificate message.
 ///
 /// Body: borsh-encoded Message
-/// On success: verifies, stores, and gossips to peers.
+/// On success: verifies and stores. Never forwards to peers — propagation is
+/// pull-based (peers sync from us).
 async fn handle_message(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -180,7 +311,9 @@ async fn handle_message(
     body: Bytes,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    crate::stats::bump(&state.stats.messages_received);
     if state.limiters.message.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_message);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited".to_string());
     }
 
@@ -203,15 +336,159 @@ async fn handle_message(
         }
     };
 
-    // Verify and store
-    if let Err(e) = state.handler.handle_message(msg) {
-        tracing::warn!("failed to handle message: {}", e);
-        return (StatusCode::BAD_REQUEST, format!("rejected: {}", e));
+    // Global verify cap: shed load instead of queueing unbounded CPU work
+    let Ok(_permit) = Arc::clone(&state.verify_sem).try_acquire_owned() else {
+        crate::stats::bump(&state.stats.busy_rejections);
+        return (StatusCode::SERVICE_UNAVAILABLE, "busy".to_string());
+    };
+
+    // Retention admission gate: under storage pressure, spaces over their
+    // entitlement accept no new handles (updates still pass).
+    let mut gated_spaces = std::collections::HashSet::new();
+    for bundle in &msg.spaces {
+        let space = bundle.subject.to_string();
+        if !gated_spaces.contains(&space)
+            && crate::retention::first_insert_gated(&state, &state.retention, &space)
+                .unwrap_or(false)
+        {
+            gated_spaces.insert(space);
+        }
     }
 
-    gossip_message(state, body).await;
+    // Verify and store on the blocking pool: ZK receipt verification is
+    // CPU-bound and must not stall the async runtime.
+    let blocking_state = Arc::clone(&state);
+    let result = tokio::task::spawn_blocking(move || {
+        blocking_state
+            .handler
+            .handle_message_gated(msg, &gated_spaces)
+    })
+    .await;
+    match result {
+        Ok(Ok(result)) => {
+            crate::stats::bump_by(&state.stats.admission_gated, result.gated as u64);
+            if result.stored > 0 {
+                crate::stats::bump(&state.stats.messages_accepted);
+                state.poke_dirty.notify_one();
+            } else {
+                crate::stats::bump(&state.stats.messages_deduped);
+            }
+        }
+        Ok(Err(e)) => {
+            crate::stats::bump(&state.stats.messages_rejected);
+            tracing::warn!("failed to handle message: {}", e);
+            return (StatusCode::BAD_REQUEST, format!("rejected: {}", e));
+        }
+        Err(e) => {
+            tracing::error!("message verification task failed: {}", e);
+            return (
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "internal error".to_string(),
+            );
+        }
+    }
 
     (StatusCode::OK, "ok".to_string())
+}
+
+/// GET/HEAD /health - Unmetered liveness check (peer health checks and load
+/// balancers target this so they never contend with rate-limited endpoints).
+async fn handle_health() -> impl IntoResponse {
+    (StatusCode::OK, "ok")
+}
+
+/// GET /stats - Observability counters (JSON), plus live peer/semaphore state.
+async fn handle_stats(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+
+    let mut snapshot = state.stats.snapshot();
+    let (verified, unverified) = {
+        let peers = state.peers.lock().await;
+        (peers.verified_count(), peers.unverified_count())
+    };
+    snapshot["peers"] = serde_json::json!({
+        "verified": verified,
+        "unverified": unverified,
+    });
+    if let Ok((rows, bytes)) = state.handler.store.storage_totals() {
+        snapshot["storage"] = serde_json::json!({
+            "rows": rows,
+            "bytes": bytes,
+            "budget_bytes": state.retention.max_storage_bytes,
+        });
+    }
+    snapshot["concurrency"] = serde_json::json!({
+        "proof_permits_available": state.proof_sem.available_permits(),
+        "verify_permits_available": state.verify_sem.available_permits(),
+    });
+    axum::Json(snapshot).into_response()
+}
+
+/// POST /poke - A peer signals it has new data; schedule a pull from it.
+///
+/// Body: JSON [`resolver::Poke`]. Content-free fast propagation: the poke
+/// carries no records, only "pull me." Only verified peers are acted on, a
+/// cursor at or behind our watermark is dropped, and the actual pull runs
+/// through the same rate-paced sync path as the interval loop — so a poke
+/// flood cannot make us do more work than the steady-state maximum.
+async fn handle_poke(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    body: Bytes,
+) -> impl IntoResponse {
+    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    if state.limiters.poke.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_poke);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited");
+    }
+
+    crate::stats::bump(&state.stats.pokes_received);
+    let poke: resolver::Poke = match serde_json::from_slice(&body) {
+        Ok(p) => p,
+        Err(_) => return (StatusCode::BAD_REQUEST, "invalid poke format"),
+    };
+    if poke.url.len() > 256 {
+        return (StatusCode::BAD_REQUEST, "invalid url");
+    }
+    // Normalize before ANY keyed use: https://x, https://x/, https://x// all
+    // pass verification but would otherwise be distinct watermark/cooldown
+    // keys, bypassing the cursor dedup and per-peer cooldown.
+    let poke_url = crate::peer::normalize_url(&poke.url);
+    let Ok(cursor) = poke.cursor.parse::<resolver::SyncCursor>() else {
+        return (StatusCode::BAD_REQUEST, "invalid cursor");
+    };
+
+    // Poke is not discovery: act only on peers we already verified.
+    // Respond "ok" either way so the response doesn't leak table membership.
+    if !state.peers.lock().await.is_verified(&poke_url) {
+        return (StatusCode::OK, "ok");
+    }
+
+    // Claimed-cursor dedup: at or behind our watermark means nothing new.
+    // (Watermarks only ever advance from real sync pages, never from here.)
+    let watermark = state
+        .handler
+        .store
+        .get_watermark(&poke_url)
+        .ok()
+        .flatten()
+        .and_then(|c| c.parse::<resolver::SyncCursor>().ok());
+    if watermark.is_some_and(|w| cursor <= w) {
+        return (StatusCode::OK, "ok");
+    }
+
+    crate::stats::bump(&state.stats.pokes_accepted);
+    let _ = state.poke_sync_tx.send(poke_url);
+    (StatusCode::OK, "ok")
 }
 
 /// POST /announce - Announce a peer URL with capabilities.
@@ -225,6 +502,7 @@ async fn handle_announce(
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
     if state.limiters.announce.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_announce);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited");
     }
 
@@ -238,6 +516,12 @@ async fn handle_announce(
 
     if announcement.url.is_empty() || announcement.url.len() > 256 {
         return (StatusCode::BAD_REQUEST, "invalid url");
+    }
+    if let Err(reason) =
+        crate::peer::validate_peer_url(&announcement.url, state.allow_private_peers)
+    {
+        tracing::debug!("rejected announce {}: {}", announcement.url, reason);
+        return (StatusCode::BAD_REQUEST, reason);
     }
 
     let peer = PeerInfo {
@@ -267,7 +551,8 @@ async fn handle_peers(
     headers: HeaderMap,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.peers.check_key(&ip).is_err() {
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -291,7 +576,8 @@ async fn handle_query(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.query.check_key(&ip).is_err() {
+    if state.limiters.proof.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_proof);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
 
@@ -311,6 +597,14 @@ async fn handle_query(
         .map(|s| s.trim())
         .filter(|s| !s.is_empty())
         .collect();
+
+    // Requested handles are "hot": spared during retention eviction.
+    {
+        let mut heat = state.query_heat.lock().unwrap();
+        for h in &handles {
+            heat.touch(h);
+        }
+    }
 
     const MAX_HANDLES: usize = 6;
     if handles.len() > MAX_HANDLES {
@@ -367,8 +661,17 @@ async fn handle_query(
     let mut resp_headers = HeaderMap::new();
     resp_headers.insert("cache-control", "public, max-age=300".parse().unwrap());
 
+    // Global proof cap: shed load instead of queueing proof generation
+    let Ok(_permit) = state.proof_sem.try_acquire() else {
+        crate::stats::bump(&state.stats.busy_rejections);
+        return (StatusCode::SERVICE_UNAVAILABLE, vec![]).into_response();
+    };
+
     match state.handler.resolve(&state.chain, queries).await {
-        Ok(msg) => (resp_headers, msg.to_bytes()).into_response(),
+        Ok(msg) => {
+            crate::stats::bump(&state.stats.proofs_served);
+            (resp_headers, msg.to_bytes()).into_response()
+        }
         Err(e) => {
             tracing::warn!("failed to resolve query: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, vec![]).into_response()
@@ -390,7 +693,8 @@ async fn handle_anchors(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.peers.check_key(&ip).is_err() {
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -445,7 +749,8 @@ async fn handle_hints(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.query.check_key(&ip).is_err() {
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -487,7 +792,8 @@ async fn handle_reverse(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.query.check_key(&ip).is_err() {
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -528,7 +834,8 @@ async fn handle_addrs(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.query.check_key(&ip).is_err() {
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
 
@@ -565,6 +872,84 @@ async fn handle_addrs(
     }
 }
 
+/// GET /sync?cursor=<opaque>&limit=<n> - Page of stored handle rows.
+///
+/// Returns a borsh-encoded [`resolver::SyncPage`] ordered by
+/// `(updated_at, handle)`. Serving is one indexed SELECT streaming blobs
+/// exactly as stored — no proof generation. The cursor is peer-local: echo it
+/// back to this relay only.
+async fn handle_sync(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    if state.limiters.sync.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_sync);
+        return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
+    }
+
+    let cursor = match params.get("cursor").filter(|c| !c.is_empty()) {
+        Some(raw) => match raw.parse::<resolver::SyncCursor>() {
+            Ok(c) => Some(c),
+            Err(e) => return (StatusCode::BAD_REQUEST, e.as_bytes().to_vec()).into_response(),
+        },
+        None => None,
+    };
+    let limit = params
+        .get("limit")
+        .and_then(|l| l.parse::<usize>().ok())
+        .unwrap_or(MAX_SYNC_PAGE_ROWS)
+        .clamp(1, MAX_SYNC_PAGE_ROWS);
+
+    // Page reads copy up to several MB of blobs under the connection mutex —
+    // keep that off the async runtime.
+    let blocking_state = Arc::clone(&state);
+    let page = tokio::task::spawn_blocking(move || {
+        blocking_state
+            .handler
+            .store
+            .sync_page(cursor, limit, MAX_SYNC_PAGE_BYTES)
+    })
+    .await
+    .unwrap_or_else(|e| Err(anyhow::anyhow!("sync page task failed: {e}")));
+    match page {
+        Ok(page) => match borsh::to_vec(&page) {
+            Ok(bytes) => (StatusCode::OK, bytes).into_response(),
+            Err(e) => {
+                tracing::warn!("failed to serialize sync page: {}", e);
+                (StatusCode::INTERNAL_SERVER_ERROR, vec![]).into_response()
+            }
+        },
+        Err(e) => {
+            tracing::warn!("sync page failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, vec![]).into_response()
+        }
+    }
+}
+
+/// GET /sync/summary - Row count and newest cursor (JSON, curl-friendly).
+async fn handle_sync_summary(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+) -> impl IntoResponse {
+    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    if state.limiters.sync.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_sync);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+
+    match state.handler.store.sync_summary() {
+        Ok(summary) => axum::Json(summary).into_response(),
+        Err(e) => {
+            tracing::warn!("sync summary failed: {}", e);
+            (StatusCode::INTERNAL_SERVER_ERROR, "summary failed").into_response()
+        }
+    }
+}
+
 /// POST /chain-proof - Build a chain proof from a ChainProofRequest.
 ///
 /// Body: JSON ChainProofRequest
@@ -576,7 +961,8 @@ async fn handle_chain_proof(
     body: Bytes,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.query.check_key(&ip).is_err() {
+    if state.limiters.proof.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_proof);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
 
@@ -603,59 +989,21 @@ async fn handle_chain_proof(
             .into_response();
     }
 
+    // Global proof cap: shed load instead of queueing proof generation
+    let Ok(_permit) = state.proof_sem.try_acquire() else {
+        crate::stats::bump(&state.stats.busy_rejections);
+        return (StatusCode::SERVICE_UNAVAILABLE, vec![]).into_response();
+    };
+
     match state.chain.prove(&request).await {
-        Ok(proof) => (StatusCode::OK, proof.to_bytes()).into_response(),
+        Ok(proof) => {
+            crate::stats::bump(&state.stats.proofs_served);
+            (StatusCode::OK, proof.to_bytes()).into_response()
+        }
         Err(e) => {
             tracing::warn!("failed to build chain proof: {}", e);
             (StatusCode::INTERNAL_SERVER_ERROR, vec![]).into_response()
         }
-    }
-}
-
-/// Gossip a message to up to 4 random verified peers.
-async fn gossip_message(state: Arc<AppState>, msg_bytes: Bytes) {
-    use rand::seq::IndexedRandom;
-
-    let peer_list: Vec<PeerInfo> = {
-        let peers = state.peers.lock().await;
-        peers.peers_info()
-    };
-
-    let targets: Vec<_> = peer_list
-        .choose_multiple(&mut rand::rng(), 4)
-        .cloned()
-        .collect();
-
-    for peer in targets {
-        let state = Arc::clone(&state);
-        let msg_bytes = msg_bytes.clone();
-
-        tokio::spawn(async move {
-            let url = format!("{}/message", peer.url);
-            let result = state
-                .http_client
-                .post(&url)
-                .body(msg_bytes.to_vec())
-                .header("Content-Type", "application/octet-stream")
-                .send()
-                .await;
-
-            let mut peers = state.peers.lock().await;
-            match result {
-                Ok(resp) if resp.status().is_success() => {
-                    peers.mark_alive(&peer.url);
-                    tracing::trace!("gossip to {} succeeded", peer.url);
-                }
-                Ok(resp) => {
-                    peers.deprioritize(&peer.url);
-                    tracing::debug!("gossip to {} failed: {}", peer.url, resp.status());
-                }
-                Err(e) => {
-                    peers.deprioritize(&peer.url);
-                    tracing::debug!("gossip to {} failed: {}", peer.url, e);
-                }
-            }
-        });
     }
 }
 
@@ -685,6 +1033,8 @@ pub async fn bootstrap_from(
     state: &Arc<AppState>,
     bootstrap_url: &str,
 ) -> anyhow::Result<Vec<PeerInfo>> {
+    let client = state.peer_client(bootstrap_url).await?;
+
     // Announce ourselves if we have a self URL
     if let Some(ref self_url) = state.self_url {
         let announcement = Announcement {
@@ -692,18 +1042,27 @@ pub async fn bootstrap_from(
             capabilities: state.capabilities,
         };
         let url = format!("{}/announce", bootstrap_url);
-        let _ = state
-            .http_client
-            .post(&url)
-            .json(&announcement)
-            .send()
-            .await;
+        let _ = client.post(&url).json(&announcement).send().await;
     }
 
-    // Fetch their peer list
+    // Fetch their peer list, bounding how much we read from an untrusted body
     let url = format!("{}/peers", bootstrap_url);
-    let resp = state.http_client.get(&url).send().await?;
-    let peers: Vec<PeerInfo> = resp.json().await?;
+    let resp = client.get(&url).send().await?;
+    if let Some(len) = resp.content_length()
+        && len > MAX_PEERS_RESPONSE_SIZE as u64
+    {
+        anyhow::bail!("peers response too large: {} bytes", len);
+    }
+    let body = resp.bytes().await?;
+    if body.len() > MAX_PEERS_RESPONSE_SIZE {
+        anyhow::bail!("peers response too large: {} bytes", body.len());
+    }
+    let mut peers: Vec<PeerInfo> = serde_json::from_slice(&body)?;
+    peers.truncate(MAX_PEERS_PER_RESPONSE);
+    peers.retain(|p| {
+        p.url.len() <= 256
+            && crate::peer::validate_peer_url(&p.url, state.allow_private_peers).is_ok()
+    });
 
     // Add discovered peers to our table
     {

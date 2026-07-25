@@ -46,6 +46,13 @@ pub struct Config {
     pub remote_ip_header: Option<String>,
     /// Accept fake ZK receipts (for testing only).
     pub dev_mode: bool,
+    /// Accept peers with private/loopback addresses (local development and tests).
+    pub allow_private_peers: bool,
+    /// Loaded file configuration (rate limits, content caps, concurrency).
+    pub settings: crate::settings::FileConfig,
+    /// Mocked chain proof + anchors (tests only; replaces the spaced RPC).
+    #[cfg(any(test, feature = "testutil"))]
+    pub mock_chain: Option<(libveritas::msg::ChainProof, Vec<RootAnchor>)>,
 }
 
 impl Config {
@@ -63,6 +70,10 @@ impl Config {
             peer_config: PeerConfig::default(),
             remote_ip_header: None,
             dev_mode: false,
+            allow_private_peers: false,
+            settings: crate::settings::FileConfig::default(),
+            #[cfg(any(test, feature = "testutil"))]
+            mock_chain: None,
         }
     }
 }
@@ -108,15 +119,39 @@ impl Relay {
         let anchor_store = AnchorSets::from_anchors(config.anchors);
 
         let store = SqliteStore::open(&config.db_path)?;
+        #[cfg(any(test, feature = "testutil"))]
+        let chain = match config.mock_chain {
+            Some(mock) => SpacedClient::mock(mock),
+            None => SpacedClient::new(rpc_client),
+        };
+        #[cfg(not(any(test, feature = "testutil")))]
         let chain = SpacedClient::new(rpc_client);
-        let mut handler = Handler::new(veritas, store, anchor_store);
+        let rl = &config.settings.rate_limits;
+        let mut handler = Handler::new(veritas, store, anchor_store).with_content_rates(
+            rl.space_per_min,
+            std::time::Duration::from_secs(rl.handle_period_secs),
+            rl.handle_burst,
+        );
         handler.dev_mode = config.dev_mode;
 
-        let mut state = AppState::new(handler, chain, config.peer_config);
-        state.max_message_size = config.max_message_size;
+        let mut state = AppState::with_rate_limits(
+            handler,
+            chain,
+            config.peer_config,
+            config.settings.rate_limit_config(),
+        );
+        state.proof_sem = Arc::new(tokio::sync::Semaphore::new(
+            config.settings.limits.proof_concurrency.max(1),
+        ));
+        state.verify_sem = Arc::new(tokio::sync::Semaphore::new(
+            config.settings.limits.verify_concurrency.max(1),
+        ));
+        state.max_message_size = config.settings.limits.max_message_size;
+        state.retention = config.settings.retention_config();
         state.capabilities = config.capabilities;
         state.is_bootstrap = config.is_bootstrap;
         state.remote_ip_header = config.remote_ip_header;
+        state.allow_private_peers = config.allow_private_peers;
 
         if let Some(url) = config.self_url {
             state = state.with_self_url(url);
@@ -137,6 +172,25 @@ impl Relay {
             listener,
             router.into_make_service_with_connect_info::<SocketAddr>(),
         )
+        .await?;
+        Ok(())
+    }
+
+    /// Run the HTTP server, finishing in-flight requests when the shutdown
+    /// signal fires instead of dropping them mid-response.
+    pub async fn run_with_shutdown(
+        self,
+        listener: tokio::net::TcpListener,
+        mut shutdown: tokio::sync::broadcast::Receiver<()>,
+    ) -> anyhow::Result<()> {
+        let router = http::router(self.state);
+        axum::serve(
+            listener,
+            router.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(async move {
+            let _ = shutdown.recv().await;
+        })
         .await?;
         Ok(())
     }

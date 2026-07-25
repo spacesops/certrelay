@@ -1,6 +1,6 @@
 use crate::anchor::AnchorSets;
 use crate::spaced::SpacedClient;
-use crate::store::{HandleRecord, SqliteStore};
+use crate::store::{BulkStoreResult, HandleRecord, SqliteStore};
 use governor::DefaultKeyedRateLimiter;
 use governor::Quota;
 use libveritas::builder::{DataUpdateRequest, MessageBuilder};
@@ -14,12 +14,12 @@ use spaces_protocol::slabel::SLabel;
 use std::collections::{HashMap, HashSet};
 use std::num::NonZeroU32;
 use std::str::FromStr;
-use std::sync::Mutex;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Mutex, RwLock};
 
 /// Certificate handler that verifies messages and stores zones/handles.
 pub struct Handler {
-    pub veritas: Mutex<Veritas>,
+    pub veritas: RwLock<Veritas>,
     pub anchor_store: Mutex<AnchorSets>,
     pub store: SqliteStore,
     pub dev_mode: bool,
@@ -34,7 +34,7 @@ pub struct Handler {
 impl Handler {
     pub fn new(veritas: Veritas, store: SqliteStore, anchor_store: AnchorSets) -> Self {
         Self {
-            veritas: Mutex::new(veritas),
+            veritas: RwLock::new(veritas),
             anchor_store: Mutex::new(anchor_store),
             store,
             dev_mode: false,
@@ -44,10 +44,28 @@ impl Handler {
             handle_rate: governor::RateLimiter::keyed(
                 Quota::with_period(std::time::Duration::from_secs(300))
                     .unwrap()
-                    .allow_burst(NonZeroU32::new(1).unwrap()),
+                    .allow_burst(NonZeroU32::new(3).unwrap()),
             ),
             msg_count: AtomicU64::new(0),
         }
+    }
+
+    /// Override the per-space and per-handle content rate limits (config file).
+    pub fn with_content_rates(
+        mut self,
+        space_per_min: u32,
+        handle_period: std::time::Duration,
+        handle_burst: u32,
+    ) -> Self {
+        self.space_rate = governor::RateLimiter::keyed(Quota::per_minute(
+            NonZeroU32::new(space_per_min.max(1)).unwrap(),
+        ));
+        self.handle_rate = governor::RateLimiter::keyed(
+            Quota::with_period(handle_period)
+                .unwrap_or_else(|| Quota::with_period(std::time::Duration::from_secs(300)).unwrap())
+                .allow_burst(NonZeroU32::new(handle_burst.max(1)).unwrap()),
+        );
+        self
     }
 
     pub async fn resolve(
@@ -153,7 +171,7 @@ impl Handler {
         }
 
         let mut res = resolver::HintsResponse {
-            anchor_tip: self.veritas.lock().expect("lock").newest_anchor(),
+            anchor_tip: self.veritas.read().expect("lock").newest_anchor(),
             hints: vec![],
         };
 
@@ -204,8 +222,35 @@ impl Handler {
     /// Handle an incoming certificate message.
     ///
     /// Verifies the message against the current chain state, updates stored zones,
-    /// and stores any new handle records.
-    pub fn handle_message(&self, msg: msg::Message) -> anyhow::Result<()> {
+    /// and stores any new handle records. Returns the store result so callers can
+    /// distinguish new data (`stored > 0`) from duplicates and stale updates.
+    pub fn handle_message(&self, msg: msg::Message) -> anyhow::Result<BulkStoreResult> {
+        self.handle_message_opts(msg, &HashSet::new(), true)
+    }
+
+    /// [`Handler::handle_message`] with a set of spaces whose **first
+    /// inserts** must be skipped (retention admission gate under storage
+    /// pressure). Updates to existing handles are never gated.
+    pub fn handle_message_gated(
+        &self,
+        msg: msg::Message,
+        gated_spaces: &HashSet<String>,
+    ) -> anyhow::Result<BulkStoreResult> {
+        self.handle_message_opts(msg, gated_spaces, true)
+    }
+
+    /// Full-control variant: `charge_content_limits = false` exempts the
+    /// message from the per-space/per-handle velocity caps. Used by sync
+    /// ingest — silently rate-dropping synced records would advance the
+    /// watermark past data that was never stored (permanent loss); sync CPU
+    /// is already bounded by the failed-space budget and verify semaphore,
+    /// and storage by retention.
+    pub fn handle_message_opts(
+        &self,
+        msg: msg::Message,
+        gated_spaces: &HashSet<String>,
+        charge_content_limits: bool,
+    ) -> anyhow::Result<BulkStoreResult> {
         // Periodically clean up expired rate limiter entries
         if self
             .msg_count
@@ -234,7 +279,7 @@ impl Handler {
         };
         let res = self
             .veritas
-            .lock()
+            .read()
             .unwrap()
             .verify_with_options(&ctx, msg, options)?;
 
@@ -256,7 +301,32 @@ impl Handler {
         // Max offchain records size per handle (1 KB)
         const MAX_RECORDS_SIZE: usize = 1024;
 
+        // Bulk-load existing hint rows: powers the duplicate pre-skip and the
+        // churn-only rate limits (first insert of a handle is free; replacing
+        // an existing row is what gets rate limited — otherwise bootstrap sync
+        // would trip handle_rate on a network's worth of first-time handles).
+        let all_handles: Vec<String> = res.certificates().map(|c| c.subject.to_string()).collect();
+        let handle_refs: Vec<&str> = all_handles.iter().map(|s| s.as_str()).collect();
+        let existing: HashMap<String, (u32, u64, u64, Vec<u8>)> = self
+            .store
+            .get_handle_hints(&handle_refs)?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.handle,
+                    (
+                        r.epoch_height,
+                        r.offchain_seq,
+                        r.delegate_offchain_seq,
+                        r.zone_hash,
+                    ),
+                )
+            })
+            .collect();
+
         // Bundle each certificate with its zone and epoch height
+        let mut preskipped = 0usize;
+        let mut gated = 0usize;
         let mut revs: Vec<(String, String)> = Vec::new();
         // canonical_handle -> (rev_name, vec of (addr_name, addr_value))
         let mut addr_index: HashMap<String, (String, Vec<(String, String)>)> = HashMap::new();
@@ -303,8 +373,37 @@ impl Handler {
 
                 let space = cert.subject.space()?.to_string();
 
-                // Rate limit per space (100 handle updates/min) and per handle (1 per 5 min)
-                if !self.dev_mode {
+                let epoch_height = epoch_map.get(&space).copied().unwrap_or(0);
+                let offchain_seq = zone.records.seq().unwrap_or(0);
+                let delegate_offchain_seq = match &zone.delegate {
+                    ProvableOption::Exists { value: d } => d.records.seq().unwrap_or(0),
+                    _ => 0,
+                };
+
+                // Duplicate pre-skip: identical metadata AND identical zone bytes
+                // means a redelivery (multi-path sync, republish) — skip it
+                // without charging the content rate limits. The hash check
+                // matters: a better zone can carry unchanged seqs (e.g. a
+                // pending->finalized commitment transition).
+                let stored = existing.get(&handle_str);
+                if let Some((e, s, d, hash)) = stored
+                    && (*e, *s, *d) == (epoch_height, offchain_seq, delegate_offchain_seq)
+                    && borsh::to_vec(*zone).is_ok_and(|z| crate::store::zone_hash(&z) == *hash)
+                {
+                    preskipped += 1;
+                    return None;
+                }
+
+                // Retention admission gate: under storage pressure, spaces
+                // over their entitlement get no new handles (updates pass).
+                if stored.is_none() && gated_spaces.contains(&space) {
+                    gated += 1;
+                    return None;
+                }
+
+                // Rate limit per space (100 handle updates/min) and per handle
+                // (1 per 5 min) — churn only: first insert of a handle is free.
+                if charge_content_limits && !self.dev_mode && stored.is_some() {
                     if self.space_rate.check_key(&space).is_err() {
                         tracing::warn!("{}: space rate limited, skipping", space);
                         return None;
@@ -314,12 +413,6 @@ impl Handler {
                         return None;
                     }
                 }
-                let epoch_height = epoch_map.get(&space).copied().unwrap_or(0);
-                let offchain_seq = zone.records.seq().unwrap_or(0);
-                let delegate_offchain_seq = match &zone.delegate {
-                    ProvableOption::Exists { value: d } => d.records.seq().unwrap_or(0),
-                    _ => 0,
-                };
                 Some(HandleRecord {
                     cert,
                     zone: (*zone).clone(),
@@ -330,7 +423,9 @@ impl Handler {
             })
             .collect();
 
-        let result = self.store.update_handles(&updates)?;
+        let mut result = self.store.update_handles(&updates)?;
+        result.skipped += preskipped;
+        result.gated += gated;
         tracing::debug!(
             "stored {} handles, skipped {} (existing zone was better)",
             result.stored,
@@ -356,7 +451,7 @@ impl Handler {
             }
         }
 
-        Ok(())
+        Ok(result)
     }
 }
 

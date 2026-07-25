@@ -6,6 +6,82 @@ use std::{
 
 pub use resolver::{PeerInfo, capabilities};
 
+/// Syntactic policy check for a peer URL: http(s) scheme, a host, no
+/// credentials, and — unless `allow_private` — no private/reserved IP literal.
+/// Plain http and bare-IP URLs are allowed by design: peer data re-verifies
+/// locally, so the network must not depend on DNS/CA infrastructure.
+/// DNS-named hosts are additionally resolve-checked in [`peer_addr_allowed`].
+pub fn validate_peer_url(raw: &str, allow_private: bool) -> Result<(), &'static str> {
+    let parsed = url::Url::parse(raw).map_err(|_| "invalid url")?;
+    if parsed.scheme() != "http" && parsed.scheme() != "https" {
+        return Err("url scheme must be http or https");
+    }
+    if !parsed.username().is_empty() || parsed.password().is_some() {
+        return Err("url must not contain credentials");
+    }
+    match parsed.host() {
+        None => Err("url must have a host"),
+        Some(url::Host::Domain(_)) => Ok(()),
+        Some(url::Host::Ipv4(ip)) if allow_private || ip_is_public(&IpAddr::V4(ip)) => Ok(()),
+        Some(url::Host::Ipv6(ip)) if allow_private || ip_is_public(&IpAddr::V6(ip)) => Ok(()),
+        Some(_) => Err("url resolves to a private address"),
+    }
+}
+
+/// Resolve a peer URL's host and check every address against the IP policy.
+/// Returns false on resolution failure — an unresolvable peer can re-announce.
+pub async fn peer_addr_allowed(raw: &str, allow_private: bool) -> bool {
+    if validate_peer_url(raw, allow_private).is_err() {
+        return false;
+    }
+    if allow_private {
+        return true;
+    }
+    let Ok(parsed) = url::Url::parse(raw) else {
+        return false;
+    };
+    match parsed.host() {
+        Some(url::Host::Domain(domain)) => {
+            let port = parsed.port_or_known_default().unwrap_or(443);
+            match tokio::net::lookup_host((domain, port)).await {
+                Ok(mut addrs) => addrs.all(|a| ip_is_public(&a.ip())),
+                Err(_) => false,
+            }
+        }
+        Some(url::Host::Ipv4(_)) | Some(url::Host::Ipv6(_)) => true, // checked above
+        None => false,
+    }
+}
+
+/// True if the address is publicly routable (not private, loopback,
+/// link-local, CGNAT, documentation, or otherwise reserved).
+pub(crate) fn ip_is_public(ip: &IpAddr) -> bool {
+    match ip {
+        IpAddr::V4(v4) => {
+            let o = v4.octets();
+            !(v4.is_private()
+                || v4.is_loopback()
+                || v4.is_link_local()
+                || v4.is_broadcast()
+                || v4.is_documentation()
+                || v4.is_unspecified()
+                || o[0] == 0
+                || (o[0] == 100 && (o[1] & 0xc0) == 64)) // CGNAT 100.64/10
+        }
+        IpAddr::V6(v6) => {
+            if let Some(v4) = v6.to_ipv4_mapped() {
+                return ip_is_public(&IpAddr::V4(v4));
+            }
+            let s = v6.segments();
+            !(v6.is_loopback()
+                || v6.is_unspecified()
+                || (s[0] & 0xfe00) == 0xfc00 // unique local fc00::/7
+                || (s[0] & 0xffc0) == 0xfe80 // link-local fe80::/10
+                || (s[0] == 0x2001 && s[1] == 0xdb8)) // documentation
+        }
+    }
+}
+
 pub struct PeerTable {
     /// IP -> announced URL (one slot per IP)
     ip_slots: HashMap<IpAddr, String>,
@@ -183,6 +259,22 @@ impl PeerTable {
         }
     }
 
+    /// True if the URL is a verified, non-stale peer.
+    pub fn is_verified(&self, url: &str) -> bool {
+        let url = normalize_url(url);
+        self.verified
+            .get(&url)
+            .is_some_and(|e| Instant::now().duration_since(e.last_seen) < self.config.verified_ttl)
+    }
+
+    /// Remove a peer entirely (e.g., its address failed the IP policy).
+    pub fn remove(&mut self, url: &str) {
+        let url = normalize_url(url);
+        self.unverified.remove(&url);
+        self.verified.remove(&url);
+        self.ip_slots.retain(|_, u| *u != url);
+    }
+
     /// Deprioritize a URL after a failed health check.
     /// Bumps it to the back of the line instead of removing it.
     pub fn deprioritize(&mut self, url: &str) {
@@ -229,6 +321,34 @@ impl PeerTable {
             .map(|(url, _)| url.as_str())
     }
 
+    /// Up to `n` unverified candidates to health-check, least-recently-seen
+    /// first, so simultaneous expiries don't drain the verified list one
+    /// candidate at a time.
+    pub fn next_candidates(&self, n: usize) -> Vec<String> {
+        let mut entries: Vec<(&String, Instant)> = self
+            .unverified
+            .iter()
+            .map(|(url, e)| (url, e.last_seen))
+            .collect();
+        entries.sort_by_key(|(_, t)| *t);
+        entries
+            .into_iter()
+            .take(n)
+            .map(|(u, _)| u.clone())
+            .collect()
+    }
+
+    /// Verified peers past half their TTL: due for a proactive liveness
+    /// refresh so quiet periods (no sync traffic) don't expire them.
+    pub fn refresh_candidates(&self) -> Vec<String> {
+        let now = Instant::now();
+        self.verified
+            .iter()
+            .filter(|(_, e)| now.duration_since(e.last_seen) >= self.config.verified_ttl / 2)
+            .map(|(url, _)| url.clone())
+            .collect()
+    }
+
     /// True if we need more verified peers.
     pub fn needs_peers(&self) -> bool {
         let active = self
@@ -260,7 +380,7 @@ impl PeerTable {
     }
 }
 
-fn normalize_url(url: &str) -> String {
+pub(crate) fn normalize_url(url: &str) -> String {
     url.trim().trim_end_matches('/').to_string()
 }
 
@@ -369,6 +489,56 @@ mod tests {
 
         let result = table.announce(&peer(1, "https://relay1.com"));
         assert_eq!(result, AnnounceResult::AlreadyVerified);
+    }
+
+    #[test]
+    fn url_policy() {
+        // Allowed: http and https, domains and public IP literals, with ports
+        for ok in [
+            "https://relay.example.com",
+            "http://relay.example.com:7778",
+            "http://8.8.8.8:7778",
+        ] {
+            assert!(validate_peer_url(ok, false).is_ok(), "{ok} should pass");
+        }
+
+        // Rejected without allow_private
+        for bad in [
+            "http://127.0.0.1:7778",
+            "http://10.0.0.5",
+            "http://192.168.1.10:7778",
+            "http://169.254.169.254/latest/meta-data",
+            "http://100.64.0.1",
+            "http://[::1]:7778",
+            "http://[fc00::1]",
+            "ftp://relay.example.com",
+            "file:///etc/passwd",
+            "http://user:pass@relay.example.com",
+            "not a url",
+        ] {
+            assert!(validate_peer_url(bad, false).is_err(), "{bad} should fail");
+        }
+
+        // allow_private admits loopback/private, still rejects bad schemes
+        assert!(validate_peer_url("http://127.0.0.1:7778", true).is_ok());
+        assert!(validate_peer_url("ftp://127.0.0.1", true).is_err());
+    }
+
+    #[test]
+    fn remove_clears_everywhere() {
+        let mut table = PeerTable::new(config());
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&peer(2, "https://relay2.com"));
+        table.mark_alive("https://relay2.com");
+
+        table.remove("https://relay1.com");
+        table.remove("https://relay2.com");
+        assert_eq!(table.unverified_count(), 0);
+        assert_eq!(table.verified_count(), 0);
+
+        // Re-announcing after removal works (ip slot was freed)
+        table.announce(&peer(1, "https://relay1.com"));
+        assert_eq!(table.unverified_count(), 1);
     }
 
     #[test]
