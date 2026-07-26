@@ -297,6 +297,86 @@ pub struct AddrEntry {
     pub rev: String,
 }
 
+/// One stored handle row served by `GET /sync` (borsh-encoded inside [`SyncPage`]).
+///
+/// `cert` and `zone` are opaque borsh blobs passed through exactly as stored.
+/// The metadata fields mirror the serving relay's table columns and are
+/// **claims** used only for duplicate pre-filtering — a puller must never store
+/// them; real values are re-derived from the zone after full verification.
+#[derive(Clone, Debug, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct SyncRecord {
+    pub handle: String,
+    pub epoch_height: u32,
+    pub seq: u64,
+    pub delegate_seq: u64,
+    pub cert: Vec<u8>,
+    pub zone: Vec<u8>,
+}
+
+impl SyncRecord {
+    /// The space portion of the handle (`"alice@bitcoin"` -> `"@bitcoin"`).
+    pub fn space_name(&self) -> &str {
+        match self.handle.find(['@', '#']) {
+            Some(i) => &self.handle[i..],
+            None => &self.handle,
+        }
+    }
+}
+
+/// A page of sync records. `next_cursor` is `None` when the page is empty
+/// (nothing beyond the requested cursor).
+#[derive(Clone, Debug, Default, borsh::BorshSerialize, borsh::BorshDeserialize)]
+pub struct SyncPage {
+    pub records: Vec<SyncRecord>,
+    pub next_cursor: Option<String>,
+}
+
+/// Body of `POST /poke` (JSON): "I have new data up to `cursor` — pull me."
+///
+/// Content-free by design: a poke can never transfer state, so it can never
+/// amplify. `url` must already be a verified peer of the receiver (poke is not
+/// discovery), and `cursor` is a claim checked against the receiver's
+/// watermark — the watermark itself only advances from real sync pages.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct Poke {
+    /// The sender's own base URL (where to pull from).
+    pub url: String,
+    /// The sender's latest sync cursor.
+    pub cursor: String,
+}
+
+/// Response of `GET /sync/summary` (JSON, curl-friendly).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+pub struct SyncSummary {
+    /// Total handle rows stored.
+    pub count: u64,
+    /// Cursor of the newest stored row, if any.
+    pub latest_cursor: Option<String>,
+}
+
+/// Sync cursor: position in a relay's strictly-increasing write sequence.
+///
+/// Cursors are **peer-local** (they encode the serving relay's private write
+/// counter): echo them back to the relay that issued them and compare only
+/// cursors from the same relay. Serialized as a decimal string; treat the
+/// format as opaque.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord)]
+pub struct SyncCursor(pub u64);
+
+impl fmt::Display for SyncCursor {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.0)
+    }
+}
+
+impl FromStr for SyncCursor {
+    type Err = &'static str;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        s.parse().map(Self).map_err(|_| "invalid cursor")
+    }
+}
+
 impl AnchorSet {
     pub fn from_anchors(anchors: Vec<RootAnchor>) -> Self {
         Self { entries: anchors }

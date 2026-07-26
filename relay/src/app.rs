@@ -52,13 +52,22 @@ struct Args {
     #[arg(long, env = "CERTRELAY_REMOTE_IP_HEADER")]
     remote_ip_header: Option<String>,
 
-    /// Anchor refresh interval in seconds (default: 1800 = 30 minutes)
+    /// Anchor refresh interval in seconds (default: 300 = 5 minutes)
     #[arg(long, default_value = "300", env = "CERTRELAY_ANCHOR_REFRESH")]
     anchor_refresh: u64,
 
     /// Skip downloading a checkpoint and sync from scratch
     #[arg(long)]
     skip_checkpoint_sync: bool,
+
+    /// Accept peers with private/loopback addresses (local development only)
+    #[arg(long, env = "CERTRELAY_ALLOW_PRIVATE_PEERS")]
+    allow_private_peers: bool,
+
+    /// Path to a TOML config file for rate limits, sync tuning, peer table
+    /// sizes, and concurrency caps (all fields optional)
+    #[arg(long, env = "CERTRELAY_CONFIG")]
+    config: Option<PathBuf>,
 }
 
 fn default_data_dir() -> PathBuf {
@@ -169,11 +178,24 @@ pub async fn run(
         spaced_url = Some(spaced_auth_url);
     }
 
+    let settings = match &args.config {
+        Some(path) => {
+            let s = crate::settings::FileConfig::load(path)?;
+            tracing::info!("loaded config from {}", path.display());
+            s
+        }
+        None => crate::settings::FileConfig::default(),
+    };
+    let sync_config = settings.sync_config();
+
     let mut config = Config::new(data_dir, args.chain);
     config.spaced_url = spaced_url;
     config.is_bootstrap = args.is_bootstrap;
     config.self_url = args.self_url;
     config.remote_ip_header = args.remote_ip_header;
+    config.allow_private_peers = args.allow_private_peers;
+    config.peer_config = settings.peer_config();
+    config.settings = settings;
 
     let relay = Relay::new(config)?;
 
@@ -211,37 +233,34 @@ pub async fn run(
         }
     });
 
-    // Periodically verify unverified peers when we need more verified ones
-    tokio::spawn({
-        let state = relay.state().clone();
-        async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(10));
-            loop {
-                interval.tick().await;
-                let candidate = {
-                    let mut peers = state.peers.lock().await;
-                    peers.demote_expired();
-                    if !peers.needs_peers() {
-                        continue;
-                    }
-                    peers.next_candidate().map(|s| s.to_string())
-                };
-                if let Some(url) = candidate {
-                    let check_url = format!("{}/peers", url);
-                    match state.http_client.head(&check_url).send().await {
-                        Ok(resp) if resp.status().is_success() => {
-                            let mut peers = state.peers.lock().await;
-                            peers.mark_alive(&url);
-                            tracing::debug!("verified peer: {}", url);
-                        }
-                        _ => {
-                            tracing::debug!("peer health check failed: {}", url);
-                        }
-                    }
-                }
-            }
-        }
-    });
+    // Storage retention: entitlement-weighted eviction under the disk budget
+    tokio::spawn(crate::retention::run_retention_loop(
+        relay.state().clone(),
+        relay.state().retention.clone(),
+    ));
+
+    // Peer-table maintenance: proactive refresh of verified peers, candidate
+    // verification, and rate-limiter map cleanup
+    tokio::spawn(crate::sync::run_peer_maintenance_loop(
+        relay.state().clone(),
+        std::time::Duration::from_secs(10),
+        3,
+    ));
+
+    // Pull-based propagation: periodically sync stored handles from peers,
+    // send pokes when we store new data, and pull promptly when poked.
+    tokio::spawn(crate::sync::run_sync_loop(
+        relay.state().clone(),
+        sync_config.clone(),
+    ));
+    tokio::spawn(crate::sync::run_poke_send_loop(
+        relay.state().clone(),
+        sync_config.clone(),
+    ));
+    tokio::spawn(crate::sync::run_poke_sync_loop(
+        relay.state().clone(),
+        sync_config,
+    ));
 
     // Periodically re-announce to verified peers and discover new ones
     tokio::spawn({
@@ -275,14 +294,9 @@ pub async fn run(
     let listener = tokio::net::TcpListener::bind(&bind_addr).await?;
     tracing::info!("relay listening on {}", listener.local_addr()?);
 
-    let mut shutdown_rx = shutdown.subscribe();
-    tokio::select! {
-        result = relay.run(listener) => result,
-        _ = shutdown_rx.recv() => {
-            tracing::info!("shutdown signal received");
-            Ok(())
-        }
-    }
+    relay
+        .run_with_shutdown(listener, shutdown.subscribe())
+        .await
 }
 
 async fn refresh_anchors(state: &AppState) -> anyhow::Result<()> {
@@ -290,7 +304,7 @@ async fn refresh_anchors(state: &AppState) -> anyhow::Result<()> {
     let anchor_store = AnchorSets::from_anchors(anchors.clone());
     anchors.truncate(ROOT_ANCHORS_COUNT as _);
     let new_veritas = create_relay_veritas(anchors)?;
-    *state.handler.veritas.lock().unwrap() = new_veritas;
+    *state.handler.veritas.write().unwrap() = new_veritas;
     *state.handler.anchor_store.lock().unwrap() = anchor_store;
     Ok(())
 }
