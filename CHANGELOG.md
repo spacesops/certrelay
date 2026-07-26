@@ -4,6 +4,19 @@ All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
+## [0.2.4](https://github.com/spacesprotocol/certrelay/compare/fabric-v0.2.3...fabric-v0.2.4)
+ - 2026-07-26
+
+### Chore
+
+- Bump libveritas to 0.3.1, spaces crates to 0.2.1
+- *(js)* Bump libveritas to 0.3 and tighten dependency pins
+- Bump libveritas to 0.3, spaces crates to 0.2
+
+### Features
+
+- Replace push gossip with pull-based sync + pokes
+
 ## [0.2.3](https://github.com/spacesprotocol/certrelay/compare/fabric-v0.2.2...fabric-v0.2.3)
  - 2026-04-26
 
