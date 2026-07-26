@@ -9,6 +9,13 @@ on:
 permissions:
   contents: write
 
+# Serialize runs: the mirror push force-updates fabric-go's main, so two
+# concurrent runs race on the ref ("cannot lock ref refs/heads/main").
+# Queue instead of cancel so no publish is dropped.
+concurrency:
+  group: publish-go
+  cancel-in-progress: false
+
 jobs:
   publish:
     runs-on: ubuntu-latest
@@ -47,5 +54,14 @@ jobs:
           git commit -m "Release ${VERSION}"
           git tag "${VERSION}"
           git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/spacesprotocol/fabric-go.git"
-          git push origin main --force
+          # Force-mirror main; retry the ref update in case a concurrent run
+          # moved it between negotiation and lock (belt-and-suspenders on top
+          # of the concurrency group above).
+          for attempt in 1 2 3; do
+            if git push origin main --force; then
+              break
+            fi
+            echo "main push attempt ${attempt} failed; retrying in 5s"
+            sleep 5
+          done
           git push origin "${VERSION}"
