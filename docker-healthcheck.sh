@@ -3,9 +3,9 @@
 #
 # Two probes:
 #
-#   1. Liveness  - GET /peers must answer 200 within 5s. Verifies the
-#                  HTTP listener is up and the rate-limited request path
-#                  reaches the router. Always runs.
+#   1. Liveness  - GET /health must answer 200 within 5s. Unmetered
+#                  endpoint used by peer health checks and load balancers.
+#                  Always runs.
 #
 #   2. Resolve   - If the operator sets CERTRELAY_HEALTHCHECK_HANDLE
 #                  (e.g. "user@rad"), run the bundled `fabric` client
@@ -32,8 +32,8 @@ esac
 URL="http://${HEALTH_HOST}:${PORT}"
 
 # -------- Probe 1: liveness --------------------------------------------
-if ! wget -q --timeout=5 -O /dev/null "${URL}/peers"; then
-    echo "healthcheck: ${URL}/peers did not respond within 5s" >&2
+if ! wget -q --timeout=5 -O /dev/null "${URL}/health"; then
+    echo "healthcheck: ${URL}/health did not respond within 5s" >&2
     exit 1
 fi
 

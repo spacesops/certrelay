@@ -134,6 +134,17 @@ fn log_startup_env(args: &Args, data_dir: &Path) {
         args.anchor_refresh
     );
     eprintln!("  --skip-checkpoint-sync     = {}", args.skip_checkpoint_sync);
+    eprintln!(
+        "  CERTRELAY_ALLOW_PRIVATE_PEERS = {}",
+        args.allow_private_peers
+    );
+    eprintln!(
+        "  CERTRELAY_CONFIG           = {}",
+        args.config
+            .as_ref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "<unset>".to_string())
+    );
     eprintln!("  RUST_LOG                   = {}", rust_log);
 }
 

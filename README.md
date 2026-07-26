@@ -346,7 +346,7 @@ every 30s (after a 2-minute startup grace) and marks the container
 `docker ps` / your orchestrator.
 
 When the variable is unset, the healthcheck still verifies that
-`GET /peers` answers, so a crashed or wedged relay is still surfaced.
+`GET /health` answers, so a crashed or wedged relay is still surfaced.
 
 See `NOTES.md` for additional bind-mount / `--env-file` recipes.
 
