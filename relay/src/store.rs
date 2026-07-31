@@ -344,11 +344,12 @@ impl SqliteStore {
         // pinning).
         let max_seq = (now + 6 * 3600) as u64;
 
-        // Filter to entries where the incoming zone is better (or new)
-        let to_store: Vec<_> = entries
+        // Filter to entries where the incoming zone is better (or new), and
+        // preserve owner records across a commitment upgrade (see below).
+        let to_store: Vec<Prepared> = entries
             .into_iter()
             .zip(updates.iter())
-            .filter(|(e, update)| {
+            .filter_map(|(mut e, update)| {
                 if e.offchain_seq > max_seq || e.delegate_offchain_seq > max_seq {
                     tracing::warn!(
                         "{}: rejecting update, seq {} exceeds max {} (>6h in future)",
@@ -356,14 +357,50 @@ impl SqliteStore {
                         e.offchain_seq.max(e.delegate_offchain_seq),
                         max_seq
                     );
-                    return false;
+                    return None;
                 }
-                match existing_zones.get(e.handle.as_str()) {
-                    Some(existing) => update.zone.is_better_than(existing).unwrap_or(false),
-                    None => true,
+
+                let existing = match existing_zones.get(e.handle.as_str()) {
+                    None => return Some(e), // new handle, nothing to preserve
+                    Some(existing) => {
+                        if !update.zone.is_better_than(existing).unwrap_or(false) {
+                            return None; // stored zone is as good or better
+                        }
+                        existing
+                    }
+                };
+
+                // A commitment upgrade (e.g. a temp -> final cert) can arrive
+                // carrying empty or stale owner records. `is_better_than` picks
+                // it on commitment height alone, which would silently drop the
+                // owner's records. Keep them when the same key still controls the
+                // handle (script_pubkey unchanged) and the stored records are
+                // fresher — they remain valid under the new commitment. A genuine
+                // owner update (higher records seq) or a key transfer (different
+                // script_pubkey) is left untouched.
+                if existing.script_pubkey == update.zone.script_pubkey
+                    && !existing.records.is_empty()
+                    && (update.zone.records.is_empty()
+                        || existing.records.seq().unwrap_or(0)
+                            > update.zone.records.seq().unwrap_or(0))
+                {
+                    let mut merged = update.zone.clone();
+                    merged.records = existing.records.clone();
+                    match borsh::to_vec(&merged) {
+                        Ok(bytes) => {
+                            e.zone_data = bytes;
+                            e.offchain_seq = merged.records.seq().unwrap_or(0);
+                        }
+                        // Fall back to storing the incoming zone unmerged rather
+                        // than dropping the update entirely.
+                        Err(err) => {
+                            tracing::warn!("{}: merged-zone re-serialize failed: {}", e.handle, err)
+                        }
+                    }
                 }
+
+                Some(e)
             })
-            .map(|(e, _)| e)
             .collect();
 
         let skipped = updates.len() - to_store.len();

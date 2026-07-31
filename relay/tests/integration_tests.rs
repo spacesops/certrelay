@@ -256,6 +256,104 @@ fn test_incremental_zone_replacement() {
     }
 }
 
+/// A finalize upgrades a sub-handle's commitment (Unknown -> Exists) while the
+/// operator publishes empty owner records. `is_better_than` picks the finalized
+/// zone on the commitment upgrade alone — before records are ever compared —
+/// which would silently drop the owner's records. The relay must preserve them
+/// when the same key still controls the handle, and only drop them on a key
+/// change. Regression for silent record deletion on finalize.
+#[test]
+fn test_finality_upgrade_preserves_owner_records() {
+    use libveritas::ProvableOption;
+    use relay::store::HandleRecord;
+
+    let mut state = ChainState::new();
+    let mut runner = FixtureRunner::new(&mut state, single_commit_finalized());
+    runner.run(&mut state);
+    let handler = setup_handler(&state);
+    let bundle = runner.build_bundle();
+    let msg = state.message(vec![bundle]);
+    handler.handle_message(msg).unwrap();
+
+    // Sub-handles carry owner records with a not-yet-Exists commitment (proven
+    // via the space tree); the space root carries the Exists commitment.
+    let alice = handler
+        .store
+        .get_handle("alice@sovereign")
+        .unwrap()
+        .unwrap();
+    let bob = handler.store.get_handle("bob@sovereign").unwrap().unwrap();
+    let root = handler.store.get_handle("@sovereign").unwrap().unwrap();
+    assert!(
+        !alice.zone.records.is_empty(),
+        "precondition: alice has records"
+    );
+    assert!(
+        matches!(root.zone.commitment, ProvableOption::Exists { .. }),
+        "precondition: the root carries an Exists commitment to graft"
+    );
+    assert!(
+        !matches!(alice.zone.commitment, ProvableOption::Exists { .. }),
+        "precondition: the sub-handle commitment is not yet Exists"
+    );
+    let alice_seq = alice.zone.records.seq();
+
+    // A distinct controlling key for the key-change (negative) case.
+    let other_key = {
+        let mut bytes = alice.zone.script_pubkey.clone().into_bytes();
+        *bytes.last_mut().unwrap() ^= 0xff;
+        spaces_protocol::bitcoin::ScriptBuf::from_bytes(bytes)
+    };
+    assert_ne!(alice.zone.script_pubkey, other_key);
+
+    // Synthesize the finalize: upgrade the commitment to Exists (which wins
+    // is_better_than before records are looked at) and publish empty records.
+    let finalize = |src: &HandleRecord, script_pubkey| -> HandleRecord {
+        let mut zone = src.zone.clone();
+        zone.commitment = root.zone.commitment.clone(); // Exists beats Unknown
+        zone.records = Default::default(); // operator publishes empty records
+        zone.script_pubkey = script_pubkey;
+        HandleRecord {
+            cert: src.cert.clone(),
+            zone,
+            epoch_height: src.epoch_height + 1,
+            offchain_seq: 0,
+            delegate_offchain_seq: src.delegate_offchain_seq,
+        }
+    };
+
+    // (a) Same key still controls it -> records preserved, commitment upgraded.
+    let alice_final = finalize(&alice, alice.zone.script_pubkey.clone());
+    handler.store.update_handles(&[alice_final]).unwrap();
+    let after = handler
+        .store
+        .get_handle("alice@sovereign")
+        .unwrap()
+        .unwrap();
+    assert!(
+        !after.zone.records.is_empty(),
+        "owner records must survive the temp->final finalize"
+    );
+    assert_eq!(
+        after.zone.records.seq(),
+        alice_seq,
+        "preserved records keep their seq"
+    );
+    assert!(
+        matches!(after.zone.commitment, ProvableOption::Exists { .. }),
+        "the commitment upgrade must still be applied"
+    );
+
+    // (b) A key change (different script_pubkey) -> old records are dropped.
+    let bob_final = finalize(&bob, other_key);
+    handler.store.update_handles(&[bob_final]).unwrap();
+    let bob_after = handler.store.get_handle("bob@sovereign").unwrap().unwrap();
+    assert!(
+        bob_after.zone.records.is_empty(),
+        "records must NOT be preserved when the controlling key changes"
+    );
+}
+
 #[test]
 fn test_all_fixtures() {
     let fixtures: Vec<(&str, Fixture, Vec<&str>)> = vec![
