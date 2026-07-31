@@ -167,23 +167,36 @@ impl PeerTable {
             return AnnounceResult::AlreadyVerified;
         }
 
-        // Remove this IP's previous announcement if it was a different URL
-        if let Some(old_url) = self.ip_slots.get(&source_ip)
-            && *old_url != url
-        {
-            let old_url = old_url.clone();
-            // Remove old URL from unverified if no other IP points to it
-            let other_refs = self
-                .ip_slots
-                .iter()
-                .any(|(ip, u)| *ip != source_ip && *u == old_url);
-            if !other_refs {
-                self.unverified.remove(&old_url);
+        // An unspecified source IP means the announcement is unattributed
+        // (e.g. learned from a peers list, where the claimed IP is
+        // remote-controlled and unverifiable). Such entries never own an IP
+        // slot and never displace anything: they only fill spare capacity.
+        let unattributed = source_ip.is_unspecified();
+        if unattributed {
+            if !self.unverified.contains_key(&url)
+                && self.unverified.len() >= self.config.max_unverified
+            {
+                return AnnounceResult::Unverified; // table full, don't evict for it
             }
-        }
+        } else {
+            // Remove this IP's previous announcement if it was a different URL
+            if let Some(old_url) = self.ip_slots.get(&source_ip)
+                && *old_url != url
+            {
+                let old_url = old_url.clone();
+                // Remove old URL from unverified if no other IP points to it
+                let other_refs = self
+                    .ip_slots
+                    .iter()
+                    .any(|(ip, u)| *ip != source_ip && *u == old_url);
+                if !other_refs {
+                    self.unverified.remove(&old_url);
+                }
+            }
 
-        // Assign this IP's slot
-        self.ip_slots.insert(source_ip, url.clone());
+            // Assign this IP's slot
+            self.ip_slots.insert(source_ip, url.clone());
+        }
 
         // Upsert into unverified
         self.unverified
@@ -539,6 +552,61 @@ mod tests {
         // Re-announcing after removal works (ip slot was freed)
         table.announce(&peer(1, "https://relay1.com"));
         assert_eq!(table.unverified_count(), 1);
+    }
+
+    fn unattributed(url: &str) -> PeerInfo {
+        PeerInfo {
+            source_ip: IpAddr::from([0, 0, 0, 0]),
+            url: url.to_string(),
+            capabilities: 0,
+        }
+    }
+
+    /// Unattributed announcements (unspecified source IP, e.g. peers-list
+    /// propagation) never own an IP slot: they coexist instead of evicting
+    /// each other, and never displace an attributed entry.
+    #[test]
+    fn unattributed_announces_claim_no_slot() {
+        let mut table = PeerTable::new(config());
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&unattributed("https://seed1.com"));
+        table.announce(&unattributed("https://seed2.com"));
+
+        // No slot fights: all three coexist.
+        assert_eq!(table.unverified_count(), 3);
+
+        // An attributed announce from a fresh IP doesn't collide with them.
+        table.announce(&peer(2, "https://relay1.com"));
+        assert_eq!(table.unverified_count(), 3);
+    }
+
+    /// A full unverified table drops unattributed announcements instead of
+    /// letting them evict attributed entries; attributed announcements still
+    /// evict the oldest as before.
+    #[test]
+    fn unattributed_never_evicts_at_capacity() {
+        let mut table = PeerTable::new(config()); // max_unverified = 3
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&peer(2, "https://relay2.com"));
+        table.announce(&peer(3, "https://relay3.com"));
+
+        table.announce(&unattributed("https://evil.com"));
+        assert_eq!(table.unverified_count(), 3);
+        assert!(!table.next_candidates(3).iter().any(|u| u.contains("evil")));
+
+        // Refreshing an unattributed entry that's already present still works.
+        table.announce(&unattributed("https://relay2.com"));
+        assert_eq!(table.unverified_count(), 3);
+
+        // An attributed announce still rotates the table normally.
+        table.announce(&peer(4, "https://relay4.com"));
+        assert_eq!(table.unverified_count(), 3);
+        assert!(
+            table
+                .next_candidates(3)
+                .iter()
+                .any(|u| u.contains("relay4"))
+        );
     }
 
     #[test]
