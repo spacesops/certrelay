@@ -402,8 +402,16 @@ impl Handler {
                 }
 
                 // Rate limit per space (100 handle updates/min) and per handle
-                // (1 per 5 min) — churn only: first insert of a handle is free.
-                if charge_content_limits && !self.dev_mode && stored.is_some() {
+                // (1 per 5 min). Charge only cheap off-chain record churn: a
+                // replacement at the same-or-lower commitment epoch. A first
+                // insert (stored.is_none()) is free, and so is a commitment
+                // finalize / new epoch — that advances epoch_height and is
+                // already gated by on-chain transaction cost, so a daily batch
+                // finalizing every issued handle is never throttled by space_rate.
+                if charge_content_limits
+                    && !self.dev_mode
+                    && charges_churn(stored.map(|s| s.0), epoch_height)
+                {
                     if self.space_rate.check_key(&space).is_err() {
                         tracing::warn!("{}: space rate limited, skipping", space);
                         return None;
@@ -472,5 +480,34 @@ fn epoch_hint_verifiable_by(hint: &resolver::EpochHint, zone: &Zone) -> bool {
         hint.height == c.onchain.block_height && hint.root == hex::encode(c.onchain.state_root)
     } else {
         false
+    }
+}
+
+/// Whether an ingested record incurs the per-space / per-handle velocity limits.
+///
+/// Only cheap off-chain record churn is charged: a replacement at the
+/// same-or-lower commitment epoch. A first insert (`stored_epoch` is `None`) is
+/// free, and so is a commitment finalize / new epoch — that advances the epoch
+/// and is already gated by on-chain transaction cost, so a batch finalizing
+/// every issued handle is never throttled by `space_rate`.
+fn charges_churn(stored_epoch: Option<u32>, incoming_epoch: u32) -> bool {
+    stored_epoch.is_some_and(|e| incoming_epoch <= e)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::charges_churn;
+
+    #[test]
+    fn charges_only_same_or_lower_epoch_churn() {
+        // First insert of a handle: free.
+        assert!(!charges_churn(None, 100));
+        // Commitment finalize / new epoch (epoch advances): free.
+        assert!(!charges_churn(Some(100), 101));
+        assert!(!charges_churn(Some(100), 500));
+        // Off-chain record churn at the same commitment epoch: charged.
+        assert!(charges_churn(Some(100), 100));
+        // Defensive: a lower epoch is charged (is_better_than rejects it anyway).
+        assert!(charges_churn(Some(100), 99));
     }
 }
