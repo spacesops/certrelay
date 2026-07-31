@@ -995,6 +995,7 @@ async fn test_verified_peers_survive_quiet_periods() {
         max_unverified: 1000,
         max_verified: 100,
         verified_ttl: Duration::from_millis(500),
+        ..relay::PeerConfig::default()
     };
     let relay_a = Relay::new(config).unwrap();
     let state_a = relay_a.state().clone();
@@ -1013,6 +1014,7 @@ async fn test_verified_peers_survive_quiet_periods() {
         state_a.clone(),
         Duration::from_millis(50),
         3,
+        vec![], // no seeds: keep the test off the network
     ));
 
     // Wait well past several TTLs with no data traffic at all

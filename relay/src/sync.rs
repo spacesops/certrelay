@@ -124,7 +124,7 @@ pub async fn sync_round(state: &Arc<AppState>, config: &SyncConfig) {
             Err(e) => {
                 crate::stats::bump(&state.stats.sync_errors);
                 tracing::debug!("sync from {} failed: {}", url, e);
-                state.peers.lock().await.deprioritize(&url);
+                state.peers.lock().await.record_sync_failure(&url);
             }
         }
     }
@@ -133,10 +133,16 @@ pub async fn sync_round(state: &Arc<AppState>, config: &SyncConfig) {
 /// Peer-table maintenance: proactively refresh verified peers before their
 /// TTL expires (decoupling liveness from data traffic) and verify several
 /// unverified candidates per tick so simultaneous expiries recover quickly.
+///
+/// `seeds` are standing candidates re-asserted every tick, so joining the
+/// mesh never depends on a bootstrap peer's list being populated at the
+/// right moment (e.g. during a fleet-wide restart). Pass an empty list in
+/// tests to keep them off the network.
 pub async fn run_peer_maintenance_loop(
     state: Arc<AppState>,
     interval: Duration,
     candidates_per_tick: usize,
+    seeds: Vec<String>,
 ) {
     let mut ticker = tokio::time::interval(interval);
     let mut tick: u64 = 0;
@@ -152,7 +158,11 @@ pub async fn run_peer_maintenance_loop(
 
         let (refresh, candidates) = {
             let mut peers = state.peers.lock().await;
+            for seed in &seeds {
+                peers.ensure_seed(seed);
+            }
             peers.demote_expired();
+            peers.expire_unverified();
             let refresh = peers.refresh_candidates();
             let candidates = if peers.needs_peers() {
                 peers.next_candidates(candidates_per_tick)
@@ -277,7 +287,7 @@ pub async fn run_poke_sync_loop(state: Arc<AppState>, config: SyncConfig) {
             Err(e) => {
                 crate::stats::bump(&state.stats.sync_errors);
                 tracing::debug!("poke sync from {} failed: {}", url, e);
-                state.peers.lock().await.deprioritize(&url);
+                state.peers.lock().await.record_sync_failure(&url);
             }
         }
     }
