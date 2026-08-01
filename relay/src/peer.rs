@@ -254,10 +254,12 @@ impl PeerTable {
         let url = normalize_url(url);
         let now = Instant::now();
 
-        // If already verified, just refresh
+        // If already verified, just refresh. A /health (or gossip) liveness
+        // signal refreshes last_seen but must NOT clear the sync-failure count —
+        // only a real sync success does that (via `mark_synced`), so a peer with
+        // a working /health but a broken /sync still demotes.
         if let Some(entry) = self.verified.get_mut(&url) {
             entry.last_seen = now;
-            entry.sync_failures = 0;
             return;
         }
 
@@ -291,6 +293,18 @@ impl PeerTable {
             } else {
                 break;
             }
+        }
+    }
+
+    /// Record a successful sync: mark the peer alive (promote / refresh) and
+    /// clear its sync-failure counter. Unlike a bare `/health` success
+    /// (`mark_alive`), a real sync success is what proves `/sync` works, so it
+    /// is the only signal that resets the demotion counter.
+    pub fn mark_synced(&mut self, url: &str) {
+        self.mark_alive(url);
+        let url = normalize_url(url);
+        if let Some(entry) = self.verified.get_mut(&url) {
+            entry.sync_failures = 0;
         }
     }
 
@@ -596,30 +610,42 @@ mod tests {
     }
 
     /// A verified peer whose syncs keep failing is demoted back to unverified
-    /// after the threshold — a working /health must not keep a peer with a
-    /// broken /sync in the rotation forever. Any success resets the count.
+    /// after 3 consecutive failures. A working /health (`mark_alive`) refreshes
+    /// liveness but must NOT reset the sync-failure count — otherwise a broken-
+    /// /sync peer stays in the rotation forever. Only a real sync success
+    /// (`mark_synced`) resets it.
     #[test]
     fn repeated_sync_failures_demote_verified_peer() {
         let mut table = PeerTable::new(config());
         table.announce(&peer(1, "https://relay1.com"));
         table.mark_alive("https://relay1.com");
 
-        // Failures below the threshold, then a success: counter resets.
+        // A /health success between failures does NOT rescue a broken /sync.
         table.record_sync_failure("https://relay1.com");
         table.record_sync_failure("https://relay1.com");
-        table.mark_alive("https://relay1.com");
-        table.record_sync_failure("https://relay1.com");
-        table.record_sync_failure("https://relay1.com");
-        assert_eq!(table.peers(), vec!["https://relay1.com"]);
-
-        // Third consecutive failure: demoted, must re-verify.
-        table.record_sync_failure("https://relay1.com");
-        assert!(table.peers().is_empty());
+        table.mark_alive("https://relay1.com"); // health ok, sync still broken
+        table.record_sync_failure("https://relay1.com"); // 3rd consecutive
+        assert!(
+            table.peers().is_empty(),
+            "a health success must not reset the sync-failure count"
+        );
         assert_eq!(table.unverified_count(), 1);
 
-        // It can come back through the normal health-check path.
+        // Re-verify via /health, then a real sync success resets the counter.
         table.mark_alive("https://relay1.com");
         assert_eq!(table.peers(), vec!["https://relay1.com"]);
+        table.record_sync_failure("https://relay1.com");
+        table.record_sync_failure("https://relay1.com");
+        table.mark_synced("https://relay1.com"); // sync ok — resets the count
+        table.record_sync_failure("https://relay1.com");
+        table.record_sync_failure("https://relay1.com");
+        assert_eq!(
+            table.peers(),
+            vec!["https://relay1.com"],
+            "a sync success should have reset the count"
+        );
+        table.record_sync_failure("https://relay1.com"); // 3rd since reset
+        assert!(table.peers().is_empty());
     }
 
     /// Seeds are standing candidates: idempotent insert, never duplicating a

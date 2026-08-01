@@ -119,7 +119,7 @@ pub async fn sync_round(state: &Arc<AppState>, config: &SyncConfig) {
                     state.poke_dirty.notify_one();
                 }
                 state.stats.record_sync_success(&url);
-                state.peers.lock().await.mark_alive(&url);
+                state.peers.lock().await.mark_synced(&url);
             }
             Err(e) => {
                 crate::stats::bump(&state.stats.sync_errors);
@@ -282,7 +282,7 @@ pub async fn run_poke_sync_loop(state: Arc<AppState>, config: SyncConfig) {
                     state.poke_dirty.notify_one();
                 }
                 state.stats.record_sync_success(&url);
-                state.peers.lock().await.mark_alive(&url);
+                state.peers.lock().await.mark_synced(&url);
             }
             Err(e) => {
                 crate::stats::bump(&state.stats.sync_errors);
