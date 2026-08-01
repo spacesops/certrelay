@@ -1063,6 +1063,14 @@ pub async fn bootstrap_from(
         p.url.len() <= 256
             && crate::peer::validate_peer_url(&p.url, state.allow_private_peers).is_ok()
     });
+    // The claimed source_ip in a peers list is remote-controlled and
+    // unverifiable — coerce it to the unspecified address before ANY use
+    // (including the returned vec) so it can never claim an IP slot or
+    // displace entries attributed to real client IPs (see
+    // PeerTable::announce).
+    for peer in &mut peers {
+        peer.source_ip = std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED);
+    }
 
     // Add discovered peers to our table
     {

@@ -260,7 +260,10 @@ impl Announcement {
 /// Information about a peer, returned from GET /peers.
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PeerInfo {
-    /// The IP address that announced this peer.
+    /// The IP address that announced this peer. Informational only: a peers
+    /// list is remote-controlled, so receivers must not trust this field for
+    /// anything (defaults to the unspecified address when absent).
+    #[serde(default = "unspecified_ip")]
     pub source_ip: IpAddr,
     /// The URL where this peer can be reached.
     pub url: String,
@@ -272,6 +275,10 @@ impl PeerInfo {
     pub fn has_capability(&self, cap: u32) -> bool {
         self.capabilities & cap != 0
     }
+}
+
+fn unspecified_ip() -> IpAddr {
+    IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED)
 }
 
 /// A reverse record mapping a numeric identity to its human-readable name.

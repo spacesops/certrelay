@@ -238,6 +238,7 @@ impl FileConfig {
             max_unverified: p.max_unverified,
             max_verified: p.max_verified,
             verified_ttl: Duration::from_secs(p.verified_ttl_secs),
+            ..PeerConfig::default()
         }
     }
 }

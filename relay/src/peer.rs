@@ -98,6 +98,11 @@ pub struct PeerConfig {
     pub max_unverified: usize,
     pub max_verified: usize,
     pub verified_ttl: Duration,
+    /// How long an unverified entry may sit without a successful health
+    /// check or a fresh announcement before it is dropped. Generous by
+    /// design: a peer offline for days can still come back on its own, and
+    /// one that misses the window simply re-announces.
+    pub unverified_ttl: Duration,
 }
 
 impl Default for PeerConfig {
@@ -106,14 +111,24 @@ impl Default for PeerConfig {
             max_unverified: 1_000,
             max_verified: 1_00,
             verified_ttl: Duration::from_secs(600),
+            unverified_ttl: Duration::from_secs(3 * 24 * 3600),
         }
     }
 }
+
+/// Consecutive sync failures before a verified peer is demoted back to
+/// unverified (it must re-pass health checks and stops consuming sync slots).
+const SYNC_FAILURES_BEFORE_DEMOTE: u32 = 3;
 
 struct PeerEntry {
     source_ip: IpAddr,
     capabilities: u32,
     last_seen: Instant,
+    /// When this entry (re-)entered its current table. Unlike `last_seen`,
+    /// never bumped by failed checks — it anchors the unverified expiry.
+    added: Instant,
+    /// Consecutive sync failures while verified; any success resets it.
+    sync_failures: u32,
 }
 
 #[derive(Debug, PartialEq)]
@@ -167,35 +182,52 @@ impl PeerTable {
             return AnnounceResult::AlreadyVerified;
         }
 
-        // Remove this IP's previous announcement if it was a different URL
-        if let Some(old_url) = self.ip_slots.get(&source_ip)
-            && *old_url != url
-        {
-            let old_url = old_url.clone();
-            // Remove old URL from unverified if no other IP points to it
-            let other_refs = self
-                .ip_slots
-                .iter()
-                .any(|(ip, u)| *ip != source_ip && *u == old_url);
-            if !other_refs {
-                self.unverified.remove(&old_url);
+        // An unspecified source IP means the announcement is unattributed
+        // (e.g. learned from a peers list, where the claimed IP is
+        // remote-controlled and unverifiable). Such entries never own an IP
+        // slot and never displace anything: they only fill spare capacity.
+        let unattributed = source_ip.is_unspecified();
+        if unattributed {
+            if !self.unverified.contains_key(&url)
+                && self.unverified.len() >= self.config.max_unverified
+            {
+                return AnnounceResult::Unverified; // table full, don't evict for it
             }
+        } else {
+            // Remove this IP's previous announcement if it was a different URL
+            if let Some(old_url) = self.ip_slots.get(&source_ip)
+                && *old_url != url
+            {
+                let old_url = old_url.clone();
+                // Remove old URL from unverified if no other IP points to it
+                let other_refs = self
+                    .ip_slots
+                    .iter()
+                    .any(|(ip, u)| *ip != source_ip && *u == old_url);
+                if !other_refs {
+                    self.unverified.remove(&old_url);
+                }
+            }
+
+            // Assign this IP's slot
+            self.ip_slots.insert(source_ip, url.clone());
         }
 
-        // Assign this IP's slot
-        self.ip_slots.insert(source_ip, url.clone());
-
-        // Upsert into unverified
+        // Upsert into unverified. A fresh announcement is liveness evidence,
+        // so it also renews the expiry anchor.
         self.unverified
             .entry(url)
             .and_modify(|e| {
                 e.last_seen = now;
+                e.added = now;
                 e.capabilities = capabilities;
             })
             .or_insert(PeerEntry {
                 source_ip,
                 capabilities,
                 last_seen: now,
+                added: now,
+                sync_failures: 0,
             });
 
         // Evict oldest if over capacity
@@ -222,7 +254,10 @@ impl PeerTable {
         let url = normalize_url(url);
         let now = Instant::now();
 
-        // If already verified, just refresh
+        // If already verified, just refresh. A /health (or gossip) liveness
+        // signal refreshes last_seen but must NOT clear the sync-failure count —
+        // only a real sync success does that (via `mark_synced`), so a peer with
+        // a working /health but a broken /sync still demotes.
         if let Some(entry) = self.verified.get_mut(&url) {
             entry.last_seen = now;
             return;
@@ -241,6 +276,8 @@ impl PeerTable {
                 source_ip: entry.source_ip,
                 capabilities: entry.capabilities,
                 last_seen: now,
+                added: now,
+                sync_failures: 0,
             },
         );
 
@@ -256,6 +293,18 @@ impl PeerTable {
             } else {
                 break;
             }
+        }
+    }
+
+    /// Record a successful sync: mark the peer alive (promote / refresh) and
+    /// clear its sync-failure counter. Unlike a bare `/health` success
+    /// (`mark_alive`), a real sync success is what proves `/sync` works, so it
+    /// is the only signal that resets the demotion counter.
+    pub fn mark_synced(&mut self, url: &str) {
+        self.mark_alive(url);
+        let url = normalize_url(url);
+        if let Some(entry) = self.verified.get_mut(&url) {
+            entry.sync_failures = 0;
         }
     }
 
@@ -275,13 +324,82 @@ impl PeerTable {
         self.ip_slots.retain(|_, u| *u != url);
     }
 
-    /// Deprioritize a URL after a failed health check.
-    /// Bumps it to the back of the line instead of removing it.
-    pub fn deprioritize(&mut self, url: &str) {
+    /// Make a locally-configured seed URL a standing candidate. Idempotent:
+    /// inserts into unverified only when the URL is not ourselves and not
+    /// already known (either table). Called every maintenance tick, so
+    /// discovery never depends on a bootstrap peer's list being populated at
+    /// the right moment — even a lost seed entry comes right back.
+    pub fn ensure_seed(&mut self, url: &str) {
         let url = normalize_url(url);
-        if let Some(entry) = self.unverified.get_mut(&url) {
-            entry.last_seen = Instant::now();
+        if self.is_self(&url) || self.verified.contains_key(&url) {
+            return;
         }
+        let now = Instant::now();
+        // Seeds are unattributed (no real source IP is known behind their
+        // public proxied URL) but first-class: unlike propagated entries they
+        // may displace the oldest entry when the table is full.
+        self.unverified.entry(url).or_insert(PeerEntry {
+            source_ip: IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+            capabilities: 0,
+            last_seen: now,
+            added: now,
+            sync_failures: 0,
+        });
+        while self.unverified.len() > self.config.max_unverified {
+            if let Some(oldest) = self
+                .unverified
+                .iter()
+                .min_by_key(|(_, e)| e.last_seen)
+                .map(|(url, _)| url.clone())
+            {
+                self.unverified.remove(&oldest);
+                self.ip_slots.retain(|_, u| *u != oldest);
+            } else {
+                break;
+            }
+        }
+    }
+
+    /// Record a failed sync attempt from a peer.
+    ///
+    /// Unverified: bumped to the back of the health-check line. Verified:
+    /// counted, and after `SYNC_FAILURES_BEFORE_DEMOTE` consecutive failures
+    /// the peer is demoted to unverified — a peer whose `/health` answers but
+    /// whose `/sync` is broken must not keep winning sync slots. Any sync
+    /// success or verified refresh resets the counter.
+    pub fn record_sync_failure(&mut self, url: &str) {
+        let url = normalize_url(url);
+        let now = Instant::now();
+        if let Some(entry) = self.unverified.get_mut(&url) {
+            entry.last_seen = now;
+            return;
+        }
+        let Some(entry) = self.verified.get_mut(&url) else {
+            return;
+        };
+        entry.sync_failures += 1;
+        if entry.sync_failures >= SYNC_FAILURES_BEFORE_DEMOTE {
+            let mut entry = self.verified.remove(&url).unwrap();
+            tracing::info!(
+                "{}: demoting after {} sync failures",
+                url,
+                entry.sync_failures
+            );
+            entry.last_seen = now;
+            entry.added = now;
+            entry.sync_failures = 0;
+            self.unverified.insert(url, entry);
+        }
+    }
+
+    /// Drop unverified entries with no fresh announcement or successful check
+    /// within `unverified_ttl`. A peer that comes back later re-announces.
+    pub fn expire_unverified(&mut self) {
+        let now = Instant::now();
+        self.unverified
+            .retain(|_, e| now.duration_since(e.added) < self.config.unverified_ttl);
+        self.ip_slots
+            .retain(|_, u| self.unverified.contains_key(u) || self.verified.contains_key(u));
     }
 
     /// Get list of verified, non-stale peer URLs.
@@ -366,7 +484,9 @@ impl PeerTable {
             .verified
             .extract_if(|_, e| now.duration_since(e.last_seen) >= self.config.verified_ttl)
             .collect();
-        for (url, entry) in expired {
+        for (url, mut entry) in expired {
+            entry.added = now; // fresh expiry anchor in the new table
+            entry.sync_failures = 0;
             self.unverified.entry(url).or_insert(entry);
         }
     }
@@ -380,8 +500,15 @@ impl PeerTable {
     }
 }
 
+/// Canonicalize a peer URL so trivial variants map to one table identity:
+/// lowercased scheme/host, default ports elided, trailing slashes stripped
+/// (the url crate handles the first two). Unparseable input falls back to
+/// trim-only so existing behavior is preserved for it.
 pub(crate) fn normalize_url(url: &str) -> String {
-    url.trim().trim_end_matches('/').to_string()
+    match url::Url::parse(url.trim()) {
+        Ok(parsed) => parsed.as_str().trim_end_matches('/').to_string(),
+        Err(_) => url.trim().trim_end_matches('/').to_string(),
+    }
 }
 
 #[cfg(test)]
@@ -393,6 +520,7 @@ mod tests {
             max_unverified: 3,
             max_verified: 2,
             verified_ttl: Duration::from_secs(600),
+            unverified_ttl: Duration::from_secs(3 * 24 * 3600),
         }
     }
 
@@ -468,7 +596,7 @@ mod tests {
     }
 
     #[test]
-    fn deprioritize_sends_to_back() {
+    fn sync_failure_sends_unverified_to_back() {
         let mut table = PeerTable::new(config());
         table.announce(&peer(1, "https://relay1.com"));
         table.announce(&peer(2, "https://relay2.com"));
@@ -476,9 +604,124 @@ mod tests {
         // relay1 announced first, so it's the next candidate
         assert!(table.next_candidate().unwrap().contains("relay1"));
 
-        // deprioritize bumps it to the back
-        table.deprioritize("https://relay1.com");
+        // a sync failure bumps it to the back
+        table.record_sync_failure("https://relay1.com");
         assert!(table.next_candidate().unwrap().contains("relay2"));
+    }
+
+    /// A verified peer whose syncs keep failing is demoted back to unverified
+    /// after 3 consecutive failures. A working /health (`mark_alive`) refreshes
+    /// liveness but must NOT reset the sync-failure count — otherwise a broken-
+    /// /sync peer stays in the rotation forever. Only a real sync success
+    /// (`mark_synced`) resets it.
+    #[test]
+    fn repeated_sync_failures_demote_verified_peer() {
+        let mut table = PeerTable::new(config());
+        table.announce(&peer(1, "https://relay1.com"));
+        table.mark_alive("https://relay1.com");
+
+        // A /health success between failures does NOT rescue a broken /sync.
+        table.record_sync_failure("https://relay1.com");
+        table.record_sync_failure("https://relay1.com");
+        table.mark_alive("https://relay1.com"); // health ok, sync still broken
+        table.record_sync_failure("https://relay1.com"); // 3rd consecutive
+        assert!(
+            table.peers().is_empty(),
+            "a health success must not reset the sync-failure count"
+        );
+        assert_eq!(table.unverified_count(), 1);
+
+        // Re-verify via /health, then a real sync success resets the counter.
+        table.mark_alive("https://relay1.com");
+        assert_eq!(table.peers(), vec!["https://relay1.com"]);
+        table.record_sync_failure("https://relay1.com");
+        table.record_sync_failure("https://relay1.com");
+        table.mark_synced("https://relay1.com"); // sync ok — resets the count
+        table.record_sync_failure("https://relay1.com");
+        table.record_sync_failure("https://relay1.com");
+        assert_eq!(
+            table.peers(),
+            vec!["https://relay1.com"],
+            "a sync success should have reset the count"
+        );
+        table.record_sync_failure("https://relay1.com"); // 3rd since reset
+        assert!(table.peers().is_empty());
+    }
+
+    /// Seeds are standing candidates: idempotent insert, never duplicating a
+    /// verified entry and never adding ourselves.
+    #[test]
+    fn ensure_seed_is_idempotent_and_skips_self_and_verified() {
+        let mut table = PeerTable::new(config());
+        table.set_self_url("https://me.com");
+
+        table.ensure_seed("https://me.com");
+        assert_eq!(table.unverified_count(), 0);
+
+        table.ensure_seed("https://seed1.com/");
+        table.ensure_seed("https://seed1.com");
+        assert_eq!(table.unverified_count(), 1);
+
+        table.mark_alive("https://seed1.com");
+        table.ensure_seed("https://seed1.com");
+        assert_eq!(table.unverified_count(), 0);
+        assert_eq!(table.peers(), vec!["https://seed1.com"]);
+
+        // A full table still admits a seed (displacing the oldest) — unlike
+        // unattributed peers-list entries, seeds are first-class.
+        let mut table = PeerTable::new(config()); // max_unverified = 3
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&peer(2, "https://relay2.com"));
+        table.announce(&peer(3, "https://relay3.com"));
+        table.ensure_seed("https://seed1.com");
+        assert_eq!(table.unverified_count(), 3);
+        assert!(table.next_candidates(3).iter().any(|u| u.contains("seed1")));
+    }
+
+    /// Unverified entries expire after `unverified_ttl` with no fresh
+    /// announcement; failed checks (which bump `last_seen`) don't keep a dead
+    /// entry alive, while a re-announce does.
+    #[test]
+    fn unverified_entries_expire() {
+        let mut table = PeerTable::new(PeerConfig {
+            unverified_ttl: Duration::ZERO, // everything is instantly expired
+            ..config()
+        });
+        table.announce(&peer(1, "https://relay1.com"));
+        table.record_sync_failure("https://relay1.com"); // bumps last_seen only
+        table.expire_unverified();
+        assert_eq!(table.unverified_count(), 0);
+
+        // A verified peer is untouched by unverified expiry.
+        table.announce(&peer(2, "https://relay2.com"));
+        table.mark_alive("https://relay2.com");
+        table.expire_unverified();
+        assert_eq!(table.peers(), vec!["https://relay2.com"]);
+    }
+
+    /// Trivial URL variants (host case, default port, trailing slash) map to
+    /// one table identity.
+    #[test]
+    fn normalize_url_canonicalizes_variants() {
+        for v in [
+            "https://Relay1.COM",
+            "https://relay1.com:443",
+            "https://relay1.com/",
+            "  https://relay1.com  ",
+            "HTTPS://relay1.com",
+        ] {
+            assert_eq!(normalize_url(v), "https://relay1.com", "variant: {v}");
+        }
+        // Non-default ports and paths survive.
+        assert_eq!(
+            normalize_url("http://relay1.com:7778/base/"),
+            "http://relay1.com:7778/base"
+        );
+
+        let mut table = PeerTable::new(config());
+        table.announce(&peer(1, "https://Relay1.com/"));
+        table.announce(&peer(2, "https://relay1.com:443"));
+        assert_eq!(table.unverified_count(), 1);
     }
 
     #[test]
@@ -539,6 +782,61 @@ mod tests {
         // Re-announcing after removal works (ip slot was freed)
         table.announce(&peer(1, "https://relay1.com"));
         assert_eq!(table.unverified_count(), 1);
+    }
+
+    fn unattributed(url: &str) -> PeerInfo {
+        PeerInfo {
+            source_ip: IpAddr::from([0, 0, 0, 0]),
+            url: url.to_string(),
+            capabilities: 0,
+        }
+    }
+
+    /// Unattributed announcements (unspecified source IP, e.g. peers-list
+    /// propagation) never own an IP slot: they coexist instead of evicting
+    /// each other, and never displace an attributed entry.
+    #[test]
+    fn unattributed_announces_claim_no_slot() {
+        let mut table = PeerTable::new(config());
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&unattributed("https://seed1.com"));
+        table.announce(&unattributed("https://seed2.com"));
+
+        // No slot fights: all three coexist.
+        assert_eq!(table.unverified_count(), 3);
+
+        // An attributed announce from a fresh IP doesn't collide with them.
+        table.announce(&peer(2, "https://relay1.com"));
+        assert_eq!(table.unverified_count(), 3);
+    }
+
+    /// A full unverified table drops unattributed announcements instead of
+    /// letting them evict attributed entries; attributed announcements still
+    /// evict the oldest as before.
+    #[test]
+    fn unattributed_never_evicts_at_capacity() {
+        let mut table = PeerTable::new(config()); // max_unverified = 3
+        table.announce(&peer(1, "https://relay1.com"));
+        table.announce(&peer(2, "https://relay2.com"));
+        table.announce(&peer(3, "https://relay3.com"));
+
+        table.announce(&unattributed("https://evil.com"));
+        assert_eq!(table.unverified_count(), 3);
+        assert!(!table.next_candidates(3).iter().any(|u| u.contains("evil")));
+
+        // Refreshing an unattributed entry that's already present still works.
+        table.announce(&unattributed("https://relay2.com"));
+        assert_eq!(table.unverified_count(), 3);
+
+        // An attributed announce still rotates the table normally.
+        table.announce(&peer(4, "https://relay4.com"));
+        assert_eq!(table.unverified_count(), 3);
+        assert!(
+            table
+                .next_candidates(3)
+                .iter()
+                .any(|u| u.contains("relay4"))
+        );
     }
 
     #[test]

@@ -240,11 +240,13 @@ pub async fn run(
     ));
 
     // Peer-table maintenance: proactive refresh of verified peers, candidate
-    // verification, and rate-limiter map cleanup
+    // verification, rate-limiter map cleanup, and standing seed candidates
+    // (so a fleet-wide restart can't strand a relay with an empty table)
     tokio::spawn(crate::sync::run_peer_maintenance_loop(
         relay.state().clone(),
         std::time::Duration::from_secs(10),
         3,
+        BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect(),
     ));
 
     // Pull-based propagation: periodically sync stored handles from peers,
@@ -266,9 +268,13 @@ pub async fn run(
     tokio::spawn({
         let state = relay.state().clone();
         async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(20 * 60));
             loop {
-                interval.tick().await;
+                // Jittered so a fleet restarted together doesn't hit the
+                // seeds in lockstep every sweep. (Startup discovery is
+                // handled by bootstrap() and the maintenance loop's standing
+                // seed candidates, so no immediate first sweep is needed.)
+                let jitter = std::time::Duration::from_millis(rand::random_range(0..120_000));
+                tokio::time::sleep(std::time::Duration::from_secs(20 * 60) + jitter).await;
                 let mut urls: Vec<String> = {
                     let peers = state.peers.lock().await;
                     peers.peers().iter().map(|s| s.to_string()).collect()
