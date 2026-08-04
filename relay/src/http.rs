@@ -1007,15 +1007,16 @@ async fn handle_chain_proof(
     }
 }
 
-/// Bootstrap from the default bootstrap relays.
-/// Does nothing if this node is a bootstrap node itself.
-pub async fn bootstrap(state: &Arc<AppState>) {
+/// Bootstrap from the given seed relays (empty is a no-op, e.g. a non-mainnet
+/// relay with no custom `--seed`). Does nothing if this node is a bootstrap
+/// node itself.
+pub async fn bootstrap(state: &Arc<AppState>, seeds: &[String]) {
     if state.is_bootstrap {
         tracing::info!("running as bootstrap node, skipping bootstrap");
         return;
     }
 
-    for &url in BOOTSTRAP_RELAYS {
+    for url in seeds {
         match bootstrap_from(state, url).await {
             Ok(peers) => {
                 tracing::info!("bootstrapped from {}: {} peers", url, peers.len());
