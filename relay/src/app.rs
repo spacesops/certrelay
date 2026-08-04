@@ -47,6 +47,14 @@ struct Args {
     #[arg(long, env = "CERTRELAY_BOOTSTRAP")]
     is_bootstrap: bool,
 
+    /// Override the bootstrap/seed relays used for peer discovery. Repeatable
+    /// (`--seed URL --seed URL`) or comma-separated via the env var. When set,
+    /// these fully REPLACE the built-in mainnet seeds — this is how you point a
+    /// private regtest/testnet network at your own relays. When empty, mainnet
+    /// uses the built-in seeds and every other network uses none.
+    #[arg(long = "seed", env = "CERTRELAY_SEEDS", value_delimiter = ',')]
+    seeds: Vec<String>,
+
     /// HTTP header to read client IP from when behind a reverse proxy.
     /// Examples: "x-forwarded-for", "cf-connecting-ip", "x-real-ip"
     #[arg(long, env = "CERTRELAY_REMOTE_IP_HEADER")]
@@ -199,8 +207,25 @@ pub async fn run(
 
     let relay = Relay::new(config)?;
 
+    // Seeds for peer discovery. A custom --seed/CERTRELAY_SEEDS list fully
+    // replaces the defaults (this is how a regtest/testnet network points at
+    // its own relays). Otherwise only mainnet gets the built-in seeds: a
+    // non-mainnet relay that inherited the mainnet seeds would sync mainnet
+    // certificates against a chain that cannot verify them — every space fails,
+    // the failed-space circuit breaker trips each round, prove/verify CPU is
+    // burned for nothing, and a developer's test rig quietly talks to
+    // production relays. Feeds BOTH the startup bootstrap and the maintenance
+    // loops so the two can never disagree.
+    let seed_urls: Vec<String> = if !args.seeds.is_empty() {
+        args.seeds.clone()
+    } else if args.chain == ExtendedNetwork::Mainnet {
+        BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect()
+    } else {
+        Vec::new()
+    };
+
     if !relay.state().is_bootstrap {
-        bootstrap(relay.state()).await;
+        bootstrap(relay.state(), &seed_urls).await;
     }
 
     // Refresh anchors from spaced periodically
@@ -246,7 +271,7 @@ pub async fn run(
         relay.state().clone(),
         std::time::Duration::from_secs(10),
         3,
-        BOOTSTRAP_RELAYS.iter().map(|s| s.to_string()).collect(),
+        seed_urls.clone(),
     ));
 
     // Pull-based propagation: periodically sync stored handles from peers,
@@ -267,6 +292,7 @@ pub async fn run(
     // Periodically re-announce to verified peers and discover new ones
     tokio::spawn({
         let state = relay.state().clone();
+        let seed_urls = seed_urls.clone();
         async move {
             loop {
                 // Jittered so a fleet restarted together doesn't hit the
@@ -279,10 +305,11 @@ pub async fn run(
                     let peers = state.peers.lock().await;
                     peers.peers().iter().map(|s| s.to_string()).collect()
                 };
-                // Always include seeds so we stay discoverable
-                for &seed in BOOTSTRAP_RELAYS {
+                // Always include seeds so we stay discoverable (empty off
+                // mainnet unless --seed was given).
+                for seed in &seed_urls {
                     if !urls.iter().any(|u| u == seed) {
-                        urls.push(seed.to_string());
+                        urls.push(seed.clone());
                     }
                 }
                 for url in urls {
