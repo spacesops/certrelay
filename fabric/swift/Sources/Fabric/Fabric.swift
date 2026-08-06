@@ -323,8 +323,12 @@ public final class Fabric: @unchecked Sendable {
     // MARK: - Resolution
 
     /// Resolve a single handle. Returns nil if not found. Supports dotted names like `hello.alice@bitcoin`.
-    public func resolve(_ handle: String) async throws -> Zone? {
-        let zones = try await resolveAll([handle])
+    ///
+    /// - Parameter noCache: when true, bypass the client's in-memory zone cache and defeat
+    ///   HTTP-level caching (URLSession/URLCache and intermediaries) so the freshest relay
+    ///   data is fetched. Useful for reading your own write immediately after publishing.
+    public func resolve(_ handle: String, noCache: Bool = false) async throws -> Zone? {
+        let zones = try await resolveAll([handle], noCache: noCache)
         return zones.first(where: { $0.handle == handle })
     }
 
@@ -399,7 +403,11 @@ public final class Fabric: @unchecked Sendable {
     ///
     /// Returns expanded zones for all requested handles.
     /// Uses the Lookup type from libveritas for dotted-name resolution.
-    public func resolveAll(_ handles: [String]) async throws -> [Zone] {
+    ///
+    /// - Parameter noCache: when true, bypass the client's in-memory zone cache and defeat
+    ///   HTTP-level caching (URLSession/URLCache and intermediaries) so the freshest relay
+    ///   data is fetched. Useful for reading your own write immediately after publishing.
+    public func resolveAll(_ handles: [String], noCache: Bool = false) async throws -> [Zone] {
         let lookup = try Lookup(names: handles)
         var allZones = [Zone]()
 
@@ -407,7 +415,7 @@ public final class Fabric: @unchecked Sendable {
         var batch = lookup.start()
         while !batch.isEmpty {
             if batch == prevBatch { break }
-            let verified = try await resolveFlat(batch, hints: true)
+            let verified = try await resolveFlat(batch, hints: true, noCache: noCache)
             let zones = verified.zones()
             prevBatch = batch
             batch = try lookup.advance(zones: zones)
@@ -466,7 +474,7 @@ public final class Fabric: @unchecked Sendable {
     }
 
     /// Resolve a flat list of non-dotted handles in a single relay query.
-    private func resolveFlat(_ handles: [String], hints: Bool) async throws -> VerifiedMessage {
+    private func resolveFlat(_ handles: [String], hints: Bool, noCache: Bool = false) async throws -> VerifiedMessage {
         var bySpace = [String: [String]]()
         for h in handles {
             let parsed = parseHandle(h)
@@ -476,7 +484,8 @@ public final class Fabric: @unchecked Sendable {
         var queries = [Query]()
         for (space, labels) in bySpace {
             var q = Query(space: space, handles: labels)
-            if hints {
+            // Under noCache, do not seed epoch hints from the in-memory zone cache.
+            if hints && !noCache {
                 lock.lock()
                 let cached = zoneCache[space]
                 lock.unlock()
@@ -491,38 +500,44 @@ public final class Fabric: @unchecked Sendable {
         }
 
         let request = QueryRequest(queries: queries)
-        return try await query(request)
+        return try await query(request, noCache: noCache)
     }
 
-    private func query(_ request: QueryRequest) async throws -> VerifiedMessage {
+    private func query(_ request: QueryRequest, noCache: Bool = false) async throws -> VerifiedMessage {
         try await bootstrap()
 
         let ctx = QueryContext()
-        lock.lock()
-        for q in request.queries {
-            if let cached = zoneCache[q.space] {
-                try? ctx.addZone(zoneBytes: zoneToBytes(zone: cached))
+        // Under noCache, do not seed verification from the in-memory zone cache.
+        if !noCache {
+            lock.lock()
+            for q in request.queries {
+                if let cached = zoneCache[q.space] {
+                    try? ctx.addZone(zoneBytes: zoneToBytes(zone: cached))
+                }
             }
+            lock.unlock()
         }
-        lock.unlock()
 
         let relays: [String]
         if preferLatest {
-            relays = await pickRelays(request: request, count: 4)
+            relays = await pickRelays(request: request, count: 4, noCache: noCache)
         } else {
             relays = pool.shuffledUrls(4)
         }
 
-        let verified = try await sendQuery(ctx: ctx, request: request, relays: relays)
+        let verified = try await sendQuery(ctx: ctx, request: request, relays: relays, noCache: noCache)
         let zones = verified.zones()
 
-        lock.lock()
-        for zone in zones {
-            if zone.handle.hasPrefix("@") || zone.handle.hasPrefix("#") {
-                zoneCache[zone.handle] = zone
+        // Under noCache, do not write the fresh response into the in-memory zone cache.
+        if !noCache {
+            lock.lock()
+            for zone in zones {
+                if zone.handle.hasPrefix("@") || zone.handle.hasPrefix("#") {
+                    zoneCache[zone.handle] = zone
+                }
             }
+            lock.unlock()
         }
-        lock.unlock()
 
         return verified
     }
@@ -530,7 +545,8 @@ public final class Fabric: @unchecked Sendable {
     private func sendQuery(
         ctx: QueryContext,
         request: QueryRequest,
-        relays: [String]
+        relays: [String],
+        noCache: Bool = false
     ) async throws -> VerifiedMessage {
         var qParts = [String]()
         var hintParts = [String]()
@@ -556,7 +572,7 @@ public final class Fabric: @unchecked Sendable {
                     queryItems.append(URLQueryItem(name: "hints", value: hintParts.joined(separator: ",")))
                 }
                 components.queryItems = queryItems
-                let (responseData, resp) = try await session.data(from: components.url!)
+                let (responseData, resp) = try await session.data(for: makeGetRequest(url: components.url!, noCache: noCache))
                 guard let httpResp = resp as? HTTPURLResponse, httpResp.statusCode < 300 else {
                     let httpResp = resp as? HTTPURLResponse
                     pool.markFailed(url)
@@ -594,7 +610,7 @@ public final class Fabric: @unchecked Sendable {
 
     // MARK: - Relay selection
 
-    private func pickRelays(request: QueryRequest, count: Int) async -> [String] {
+    private func pickRelays(request: QueryRequest, count: Int, noCache: Bool = false) async -> [String] {
         let hintsQuery = hintsQueryString(request)
         let shuffled = pool.shuffledUrls()
         var ranked = [(url: String, hints: HintsResponse)]()
@@ -607,7 +623,7 @@ public final class Fabric: @unchecked Sendable {
             await withTaskGroup(of: (String, HintsResponse?).self) { group in
                 for url in batch {
                     group.addTask {
-                        guard let hints = try? await self.fetchHints(url: url, query: hintsQuery) else {
+                        guard let hints = try? await self.fetchHints(url: url, query: hintsQuery, noCache: noCache) else {
                             return (url, nil)
                         }
                         return (url, hints)
@@ -742,10 +758,10 @@ public final class Fabric: @unchecked Sendable {
         return try JSONDecoder().decode([PeerInfo].self, from: data)
     }
 
-    private func fetchHints(url: String, query: String) async throws -> HintsResponse {
+    private func fetchHints(url: String, query: String, noCache: Bool = false) async throws -> HintsResponse {
         var components = URLComponents(string: "\(url)/hints")!
         components.queryItems = [URLQueryItem(name: "q", value: query)]
-        let (data, resp) = try await session.data(from: components.url!)
+        let (data, resp) = try await session.data(for: makeGetRequest(url: components.url!, noCache: noCache))
         guard let httpResp = resp as? HTTPURLResponse, httpResp.statusCode < 300 else {
             throw FabricError.relay(status: 0, body: "hints fetch failed")
         }
@@ -851,6 +867,18 @@ public final class Fabric: @unchecked Sendable {
         req.httpMethod = method
         req.httpBody = body
         req.setValue(contentType, forHTTPHeaderField: "Content-Type")
+        return req
+    }
+
+    /// Build a GET request. When `noCache` is set, defeat HTTP-level caching: bypass
+    /// URLSession's URLCache (`.reloadIgnoringLocalAndRemoteCacheData`) and ask any
+    /// intermediaries not to serve a cached copy (`Cache-Control: no-cache`).
+    private func makeGetRequest(url: URL, noCache: Bool) -> URLRequest {
+        var req = URLRequest(url: url)
+        if noCache {
+            req.cachePolicy = .reloadIgnoringLocalAndRemoteCacheData
+            req.setValue("no-cache", forHTTPHeaderField: "Cache-Control")
+        }
         return req
     }
 }

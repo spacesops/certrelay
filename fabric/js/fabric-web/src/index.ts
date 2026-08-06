@@ -59,6 +59,7 @@ export {
 
 export type {
   FabricZone,
+  ResolveOptions,
   PeerInfo,
   HintsResponse,
   SpaceHint,

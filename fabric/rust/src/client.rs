@@ -64,6 +64,15 @@ impl ScanParams {
     }
 }
 
+/// Per-call resolve options.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ResolveOpts {
+    /// Bypass the client zone cache (no read, no seed, no write) and send
+    /// `Cache-Control: no-cache` so an HTTP cache / proxy doesn't serve a cached
+    /// copy. Use right after writing records to read your own write immediately.
+    pub no_cache: bool,
+}
+
 pub struct Fabric {
     http: reqwest::Client,
     pool: RelayPool,
@@ -499,7 +508,16 @@ impl Fabric {
     /// Returns None if the handle doesn't exist.
     /// Supports dotted names like `hello.alice@bitcoin`.
     pub async fn resolve(&self, handle: &str) -> Result<Option<Zone>> {
-        let zones = self.resolve_all(&[handle]).await?;
+        self.resolve_with_opts(handle, ResolveOpts::default()).await
+    }
+
+    /// Like [`resolve`](Self::resolve) but with per-call options (e.g. `no_cache`).
+    pub async fn resolve_with_opts(
+        &self,
+        handle: &str,
+        opts: ResolveOpts,
+    ) -> Result<Option<Zone>> {
+        let zones = self.resolve_all_with_opts(&[handle], opts).await?;
         Ok(zones.into_iter().find(|z| z.handle.to_string() == handle))
     }
 
@@ -622,6 +640,16 @@ impl Fabric {
 
     /// Resolve multiple handles, including nested names like `hello.alice@bitcoin`.
     pub async fn resolve_all(&self, handles: &[&str]) -> Result<Vec<Zone>> {
+        self.resolve_all_with_opts(handles, ResolveOpts::default())
+            .await
+    }
+
+    /// Like [`resolve_all`](Self::resolve_all) but with per-call options.
+    pub async fn resolve_all_with_opts(
+        &self,
+        handles: &[&str],
+        opts: ResolveOpts,
+    ) -> Result<Vec<Zone>> {
         let snames: Vec<SName> = handles
             .iter()
             .filter_map(|h| SName::try_from(*h).ok())
@@ -638,7 +666,7 @@ impl Fabric {
             }
             let strs: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
             let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-            let (verified, _relay_url) = self.resolve_flat(&refs, true).await?;
+            let (verified, _relay_url) = self.resolve_flat(&refs, true, opts.no_cache).await?;
             prev_batch = batch;
             batch = lookup.advance(&verified.zones);
             all_zones.extend(verified.zones);
@@ -664,7 +692,7 @@ impl Fabric {
             }
             let strs: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
             let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-            let (verified, _relay_url) = self.resolve_flat(&refs, false).await?;
+            let (verified, _relay_url) = self.resolve_flat(&refs, false, false).await?;
             prev_batch = batch;
             batch = lookup.advance(&verified.zones);
             all_verified.push(verified);
@@ -684,6 +712,7 @@ impl Fabric {
         &self,
         handles: &[&str],
         hints: bool,
+        no_cache: bool,
     ) -> Result<(VerifiedMessage, String)> {
         let mut by_space: HashMap<String, Vec<String>> = HashMap::new();
         for &h in handles {
@@ -704,7 +733,8 @@ impl Fabric {
             .into_iter()
             .map(|(space, handles)| {
                 let mut q = Query::new(space.clone(), handles);
-                if hints {
+                // Cached epoch hint is a cache read — skip it under no_cache.
+                if hints && !no_cache {
                     if let Some(zone) = self.root_cache.get(&space) {
                         if let Some(hint) = epoch_hint_from_zone(&zone) {
                             q = q.with_epoch_hint(hint);
@@ -715,34 +745,43 @@ impl Fabric {
             })
             .collect();
         let request = QueryRequest::new(queries);
-        self.query(&request).await
+        self.query(&request, no_cache).await
     }
 
-    async fn query(&self, request: &QueryRequest) -> Result<(VerifiedMessage, String)> {
+    async fn query(
+        &self,
+        request: &QueryRequest,
+        no_cache: bool,
+    ) -> Result<(VerifiedMessage, String)> {
         self.bootstrap().await?;
         let mut ctx = QueryContext::new();
-        request
-            .queries
-            .iter()
-            .filter_map(|q| self.root_cache.get(&q.space))
-            .map(|z| z.clone())
-            .for_each(|z| {
-                ctx.add_zone(z);
-            });
+        // Seed verification from cached zones unless bypassing the cache.
+        if !no_cache {
+            request
+                .queries
+                .iter()
+                .filter_map(|q| self.root_cache.get(&q.space))
+                .map(|z| z.clone())
+                .for_each(|z| {
+                    ctx.add_zone(z);
+                });
+        }
 
         let relays = if self.prefer_latest.load(Ordering::Relaxed) {
-            self.pick_relays(request, 4).await
+            self.pick_relays(request, 4, no_cache).await
         } else {
             self.pool.shuffled_urls_n(4)
         };
 
-        let (res, relay_url) = self.send_query(&ctx, request, &relays).await?;
-        res.zones
-            .iter()
-            .filter(|z| z.handle.is_single_label())
-            .for_each(|z| {
-                self.root_cache.insert(z.handle.to_string(), z.clone());
-            });
+        let (res, relay_url) = self.send_query(&ctx, request, &relays, no_cache).await?;
+        if !no_cache {
+            res.zones
+                .iter()
+                .filter(|z| z.handle.is_single_label())
+                .for_each(|z| {
+                    self.root_cache.insert(z.handle.to_string(), z.clone());
+                });
+        }
         Ok((res, relay_url))
     }
 
@@ -753,6 +792,7 @@ impl Fabric {
         ctx: &QueryContext,
         request: &QueryRequest,
         relays: &[String],
+        no_cache: bool,
     ) -> Result<(VerifiedMessage, String)> {
         // Build GET query params
         let mut q_parts: Vec<String> = Vec::new();
@@ -779,6 +819,9 @@ impl Fabric {
                 .query(&[("q", &q_param)]);
             if !hints_param.is_empty() {
                 req = req.query(&[("hints", &hints_param)]);
+            }
+            if no_cache {
+                req = req.header("cache-control", "no-cache");
             }
             let resp = match req.send().await {
                 Ok(r) => r,
@@ -840,7 +883,12 @@ impl Fabric {
     }
 
     /// Pick up to `count` relays sorted by freshest zone data for the specified query request.
-    async fn pick_relays(&self, request: &QueryRequest, count: usize) -> Vec<String> {
+    async fn pick_relays(
+        &self,
+        request: &QueryRequest,
+        count: usize,
+        no_cache: bool,
+    ) -> Vec<String> {
         let hints_query = hints_query_string(request);
         let shuffled = self.pool.shuffled_urls();
 
@@ -860,7 +908,11 @@ impl Fabric {
                 tasks.push((
                     url.clone(),
                     tokio::spawn(async move {
-                        let resp = http.get(&hints_url).query(&[("q", &q)]).send().await.ok()?;
+                        let mut req = http.get(&hints_url).query(&[("q", &q)]);
+                        if no_cache {
+                            req = req.header("cache-control", "no-cache");
+                        }
+                        let resp = req.send().await.ok()?;
                         if !resp.status().is_success() {
                             return None;
                         }

@@ -211,8 +211,8 @@ class Fabric(
 
     // -- Resolution --
 
-    fun resolve(handle: String): Zone? {
-        val zones = resolveAll(listOf(handle))
+    fun resolve(handle: String, noCache: Boolean = false): Zone? {
+        val zones = resolveAll(listOf(handle), noCache)
         return zones.find { it.handle == handle }
     }
 
@@ -302,7 +302,7 @@ class Fabric(
         throw lastErr
     }
 
-    fun resolveAll(handles: List<String>): List<Zone> {
+    fun resolveAll(handles: List<String>, noCache: Boolean = false): List<Zone> {
         val lookup = Lookup(handles)
         val allZones = mutableListOf<Zone>()
 
@@ -310,7 +310,7 @@ class Fabric(
         var batch = lookup.start()
         while (batch.isNotEmpty()) {
             if (batch == prevBatch) break
-            val verified = resolveFlat(batch, true)
+            val verified = resolveFlat(batch, true, noCache)
             val zones = verified.zones()
             prevBatch = batch
             batch = lookup.advance(zones)
@@ -328,7 +328,7 @@ class Fabric(
         var batch = lookup.start()
         while (batch.isNotEmpty()) {
             if (batch == prevBatch) break
-            val verified = resolveFlat(batch, false)
+            val verified = resolveFlat(batch, false, false)
             allCertBytes.addAll(verified.certificates())
             val zones = verified.zones()
             prevBatch = batch
@@ -338,7 +338,7 @@ class Fabric(
         return createCertificateChain(handle, allCertBytes)
     }
 
-    private fun resolveFlat(handles: List<String>, hints: Boolean): VerifiedMessage {
+    private fun resolveFlat(handles: List<String>, hints: Boolean, noCache: Boolean): VerifiedMessage {
         val bySpace = mutableMapOf<String, MutableList<String>>()
         for (h in handles) {
             val (space, label) = parseHandle(h)
@@ -348,7 +348,10 @@ class Fabric(
         val queries = mutableListOf<Query>()
         for ((space, labels) in bySpace) {
             var epochHint: EpochHint? = null
-            if (hints) {
+            // Under noCache we skip seeding the epoch hint from the zone cache so the
+            // relay is asked for the freshest state rather than validating against a
+            // possibly-stale cached epoch.
+            if (hints && !noCache) {
                 synchronized(lock) {
                     zoneCache[space]?.let { cached ->
                         epochHintFromZone(cached)?.let { epochHint = it }
@@ -358,34 +361,42 @@ class Fabric(
             queries.add(Query(space = space, handles = labels, epochHint = epochHint))
         }
 
-        return query(QueryRequest(queries = queries))
+        return query(QueryRequest(queries = queries), noCache)
     }
 
-    private fun query(request: QueryRequest): VerifiedMessage {
+    private fun query(request: QueryRequest, noCache: Boolean): VerifiedMessage {
         bootstrap()
 
         val ctx = QueryContext()
-        synchronized(lock) {
-            for (q in request.queries) {
-                zoneCache[q.space]?.let { cached ->
-                    try { ctx.addZone(zoneToBytes(cached)) } catch (_: Exception) {}
+        // Under noCache we neither seed the verification context from the zone cache
+        // nor read cached zones back; the relay response stands on its own.
+        if (!noCache) {
+            synchronized(lock) {
+                for (q in request.queries) {
+                    zoneCache[q.space]?.let { cached ->
+                        try { ctx.addZone(zoneToBytes(cached)) } catch (_: Exception) {}
+                    }
                 }
             }
         }
 
         val relays = if (preferLatest) {
-            pickRelays(request, 4)
+            pickRelays(request, 4, noCache)
         } else {
             pool.shuffledUrls(4)
         }
 
-        val verified = sendQuery(ctx, request, relays)
+        val verified = sendQuery(ctx, request, relays, noCache)
         val zones = verified.zones()
 
-        synchronized(lock) {
-            for (z in zones) {
-                if (z.handle.startsWith("@") || z.handle.startsWith("#")) {
-                    zoneCache[z.handle] = z
+        // Under noCache we also skip writing the fresh response into the zone cache,
+        // leaving any existing cached entry untouched.
+        if (!noCache) {
+            synchronized(lock) {
+                for (z in zones) {
+                    if (z.handle.startsWith("@") || z.handle.startsWith("#")) {
+                        zoneCache[z.handle] = z
+                    }
                 }
             }
         }
@@ -393,7 +404,7 @@ class Fabric(
         return verified
     }
 
-    private fun sendQuery(ctx: QueryContext, request: QueryRequest, relays: List<String>): VerifiedMessage {
+    private fun sendQuery(ctx: QueryContext, request: QueryRequest, relays: List<String>, noCache: Boolean): VerifiedMessage {
         val qParts = mutableListOf<String>()
         val hintParts = mutableListOf<String>()
         for (q in request.queries) {
@@ -423,6 +434,10 @@ class Fabric(
                 val conn = URI(queryUrl).toURL().openConnection() as HttpURLConnection
                 conn.connectTimeout = 10_000
                 conn.readTimeout = 10_000
+                if (noCache) {
+                    conn.useCaches = false
+                    conn.setRequestProperty("Cache-Control", "no-cache")
+                }
                 if (conn.responseCode >= 300) {
                     val errorBody = conn.errorStream?.readBytes() ?: byteArrayOf()
                     conn.disconnect()
@@ -464,7 +479,7 @@ class Fabric(
         throw lastErr
     }
 
-    private fun pickRelays(request: QueryRequest, count: Int): List<String> {
+    private fun pickRelays(request: QueryRequest, count: Int, noCache: Boolean): List<String> {
         val hintsQuery = hintsQueryString(request)
         val shuffled = pool.shuffledUrls(0)
 
@@ -480,7 +495,7 @@ class Fabric(
             val futures = batch.map { url ->
                 executor.submit(Callable {
                     try {
-                        Ranked(url, fetchHints(url, hintsQuery))
+                        Ranked(url, fetchHints(url, hintsQuery, noCache))
                     } catch (_: Exception) {
                         pool.markFailed(url)
                         null
@@ -731,11 +746,15 @@ private fun fetchPeers(relayUrl: String): List<PeerInfo> {
     return json.decodeFromString<List<PeerInfo>>(body)
 }
 
-private fun fetchHints(relayUrl: String, query: String): HintsResponse {
+private fun fetchHints(relayUrl: String, query: String, noCache: Boolean = false): HintsResponse {
     val encoded = URLEncoder.encode(query, "UTF-8")
     val conn = URI("$relayUrl/hints?q=$encoded").toURL().openConnection() as HttpURLConnection
     conn.connectTimeout = 10_000
     conn.readTimeout = 10_000
+    if (noCache) {
+        conn.useCaches = false
+        conn.setRequestProperty("Cache-Control", "no-cache")
+    }
 
     if (conn.responseCode >= 300) {
         conn.disconnect()

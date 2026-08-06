@@ -1079,6 +1079,23 @@ impl SqliteStore {
 }
 
 #[cfg(test)]
+impl SqliteStore {
+    /// Test-only: insert/replace a handle with a `zone_hash` derived from
+    /// `zone_data`, so version/ETag tests see realistic hashes.
+    pub fn test_insert(&self, handle: &str, space: &str, epoch: i64, zone_data: &[u8]) {
+        let zh = zone_hash(zone_data);
+        let conn = self.conn.lock().unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO handles \
+             (handle, space, cert_data, zone_data, epoch_height, zone_hash, updated_at) \
+             VALUES (?,?,x'01',?,?,?,100)",
+            params![handle, space, zone_data, epoch, zh],
+        )
+        .unwrap();
+    }
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
 

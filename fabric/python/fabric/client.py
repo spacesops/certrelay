@@ -25,6 +25,11 @@ BADGE_ORANGE = "orange"
 BADGE_UNVERIFIED = "unverified"
 BADGE_NONE = "none"
 
+# Request headers that ask intermediary proxies/CDNs not to serve a cached
+# copy. Relays serve `Cache-Control: max-age=5`, so without these an HTTP cache
+# may return slightly-stale data. Sent only when a caller passes no_cache=True.
+_NO_CACHE_HEADERS = {"Cache-Control": "no-cache", "Pragma": "no-cache"}
+
 
 class FabricError(Exception):
     def __init__(self, code: str, message: str, status: int = 0):
@@ -214,8 +219,8 @@ class Fabric:
             return BADGE_UNVERIFIED
         return BADGE_NONE
 
-    def resolve(self, handle: str) -> lv.Zone | None:
-        zones = self.resolve_all([handle])
+    def resolve(self, handle: str, *, no_cache: bool = False) -> lv.Zone | None:
+        zones = self.resolve_all([handle], no_cache=no_cache)
         return next((z for z in zones if z.handle == handle), None)
 
     def resolve_by_id(self, num_id: str) -> lv.Zone | None:
@@ -306,7 +311,9 @@ class Fabric:
 
         raise last_err
 
-    def resolve_all(self, handles: list[str]) -> list[lv.Zone]:
+    def resolve_all(
+        self, handles: list[str], *, no_cache: bool = False
+    ) -> list[lv.Zone]:
         lookup = lv.Lookup(handles)
         all_zones: list[lv.Zone] = []
 
@@ -315,7 +322,7 @@ class Fabric:
         while batch:
             if batch == prev_batch:
                 break
-            verified = self._resolve_flat(batch, hints=True)
+            verified = self._resolve_flat(batch, hints=True, no_cache=no_cache)
             zones = verified.zones()
             prev_batch = batch
             batch = lookup.advance(zones)
@@ -497,7 +504,9 @@ class Fabric:
             else:
                 self._observed = trust_set
 
-    def _resolve_flat(self, handles: list[str], *, hints: bool = True) -> lv.VerifiedMessage:
+    def _resolve_flat(
+        self, handles: list[str], *, hints: bool = True, no_cache: bool = False
+    ) -> lv.VerifiedMessage:
         by_space: dict[str, list[str]] = {}
         for h in handles:
             space, label = _parse_handle(h)
@@ -506,7 +515,9 @@ class Fabric:
         queries = []
         for space, labels in by_space.items():
             q = _Query(space=space, handles=labels)
-            if hints:
+            # Under no_cache we don't seed epoch hints from the local zone
+            # cache, so the relay isn't nudged toward a possibly-stale epoch.
+            if hints and not no_cache:
                 with self._lock:
                     cached = self._zone_cache.get(space)
                     if cached is not None:
@@ -515,33 +526,39 @@ class Fabric:
                             q.epoch_hint = hint
             queries.append(q)
 
-        return self._query(_QueryRequest(queries=queries))
+        return self._query(_QueryRequest(queries=queries), no_cache=no_cache)
 
-    def _query(self, request: _QueryRequest) -> lv.VerifiedMessage:
+    def _query(
+        self, request: _QueryRequest, *, no_cache: bool = False
+    ) -> lv.VerifiedMessage:
         self.bootstrap()
 
         ctx = lv.QueryContext()
-        with self._lock:
-            for q in request.queries:
-                cached = self._zone_cache.get(q.space)
-                if cached is not None:
-                    try:
-                        ctx.add_zone(lv.zone_to_bytes(cached))
-                    except Exception:
-                        pass
+        # Under no_cache we don't seed verification from the local zone cache.
+        if not no_cache:
+            with self._lock:
+                for q in request.queries:
+                    cached = self._zone_cache.get(q.space)
+                    if cached is not None:
+                        try:
+                            ctx.add_zone(lv.zone_to_bytes(cached))
+                        except Exception:
+                            pass
 
         if self._prefer_latest:
-            relays = self._pick_relays(request, 4)
+            relays = self._pick_relays(request, 4, no_cache=no_cache)
         else:
             relays = self._pool.shuffled_urls(4)
 
-        verified = self._send_query(ctx, request, relays)
+        verified = self._send_query(ctx, request, relays, no_cache=no_cache)
 
-        zones = verified.zones()
-        with self._lock:
-            for z in zones:
-                if z.handle.startswith("@") or z.handle.startswith("#"):
-                    self._zone_cache[z.handle] = z
+        # Under no_cache we don't write the fresh response into the zone cache.
+        if not no_cache:
+            zones = verified.zones()
+            with self._lock:
+                for z in zones:
+                    if z.handle.startswith("@") or z.handle.startswith("#"):
+                        self._zone_cache[z.handle] = z
 
         return verified
 
@@ -550,6 +567,8 @@ class Fabric:
         ctx: lv.QueryContext,
         request: _QueryRequest,
         relays: list[str],
+        *,
+        no_cache: bool = False,
     ) -> lv.VerifiedMessage:
         q_parts: list[str] = []
         hint_parts: list[str] = []
@@ -573,7 +592,8 @@ class Fabric:
                 if hint_parts:
                     params["hints"] = ",".join(hint_parts)
                 query_url = u + "/query?" + urlencode(params)
-                req = Request(query_url)
+                headers = dict(_NO_CACHE_HEADERS) if no_cache else {}
+                req = Request(query_url, headers=headers)
                 with urlopen(req, timeout=10) as resp:
                     resp_bytes = resp.read()
                     if resp.status >= 300:
@@ -612,7 +632,9 @@ class Fabric:
 
         raise last_err
 
-    def _pick_relays(self, request: _QueryRequest, count: int) -> list[str]:
+    def _pick_relays(
+        self, request: _QueryRequest, count: int, *, no_cache: bool = False
+    ) -> list[str]:
         hints_query = _hints_query_string(request)
         shuffled = self._pool.shuffled_urls(0)
 
@@ -625,7 +647,8 @@ class Fabric:
 
             with ThreadPoolExecutor(max_workers=len(batch)) as pool:
                 futures = {
-                    pool.submit(_fetch_hints, u, hints_query): u for u in batch
+                    pool.submit(_fetch_hints, u, hints_query, no_cache): u
+                    for u in batch
                 }
                 for fut in as_completed(futures):
                     u = futures[fut]
@@ -752,9 +775,12 @@ def _fetch_peers(relay_url: str) -> list[dict]:
         return json.loads(resp.read())
 
 
-def _fetch_hints(relay_url: str, query: str) -> HintsResponse:
+def _fetch_hints(
+    relay_url: str, query: str, no_cache: bool = False
+) -> HintsResponse:
     url = relay_url + "/hints?" + urlencode({"q": query})
-    req = Request(url)
+    headers = dict(_NO_CACHE_HEADERS) if no_cache else {}
+    req = Request(url, headers=headers)
     with urlopen(req, timeout=10) as resp:
         if resp.status >= 300:
             raise FabricError("relay", f"hints: status {resp.status}")
