@@ -163,6 +163,16 @@ pub fn zone_hash(zone_data: &[u8]) -> Vec<u8> {
     sha2::Sha256::digest(zone_data).to_vec()
 }
 
+/// Finality ordering for comparing zones — higher is more final.
+fn sovereignty_rank(s: libveritas::SovereigntyState) -> u8 {
+    use libveritas::SovereigntyState::*;
+    match s {
+        Sovereign => 2,
+        Pending => 1,
+        Dependent => 0,
+    }
+}
+
 /// SQLite-backed store for handles.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -363,7 +373,25 @@ impl SqliteStore {
                 let existing = match existing_zones.get(e.handle.as_str()) {
                     None => return Some(e), // new handle, nothing to preserve
                     Some(existing) => {
-                        if !update.zone.is_better_than(existing).unwrap_or(false) {
+                        // A temp->final finalization (or a re-proof after a newer
+                        // commitment) carries a fresher anchor but often EMPTY owner
+                        // records. For a sub-handle both zones have Unknown
+                        // commitment, so is_better_than falls to the records check
+                        // and rejects the empty-records final BEFORE the anchor
+                        // tiebreaker — leaving the relay serving a stale temp that no
+                        // longer verifies against the tip. Accept a strictly fresher
+                        // proof from the same key as long as it doesn't downgrade
+                        // finality; the owner's records are preserved by the merge
+                        // below. Incoming certs are already verified against current
+                        // anchors, so a higher anchor is genuine fresher chain truth.
+                        let fresher_proof = update.zone.script_pubkey
+                            == existing.script_pubkey
+                            && update.zone.anchor > existing.anchor
+                            && sovereignty_rank(update.zone.sovereignty)
+                                >= sovereignty_rank(existing.sovereignty);
+                        if !fresher_proof
+                            && !update.zone.is_better_than(existing).unwrap_or(false)
+                        {
                             return None; // stored zone is as good or better
                         }
                         existing

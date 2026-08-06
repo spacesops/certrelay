@@ -354,6 +354,70 @@ fn test_finality_upgrade_preserves_owner_records() {
     );
 }
 
+/// The harder finalize: a sub-handle temp->final where the commitment stays
+/// Unknown (finality comes from the parent, not the sub-handle's own on-chain
+/// commitment) and the final carries EMPTY owner records but a fresher anchor.
+/// `is_better_than` sees equal commitments and rejects the empty-records final at
+/// the records comparison, BEFORE the anchor tiebreaker — so without the
+/// fresher-proof acceptance the relay keeps serving a stale temp that no longer
+/// verifies against the tip. Regression for the `nzjsk@test10000` case.
+#[test]
+fn test_finalize_without_commitment_upgrade_replaces_temp() {
+    use relay::store::HandleRecord;
+
+    let mut state = ChainState::new();
+    let mut runner = FixtureRunner::new(&mut state, single_commit_finalized());
+    runner.run(&mut state);
+    let handler = setup_handler(&state);
+    let bundle = runner.build_bundle();
+    let msg = state.message(vec![bundle]);
+    handler.handle_message(msg).unwrap();
+
+    let alice = handler
+        .store
+        .get_handle("alice@sovereign")
+        .unwrap()
+        .unwrap();
+    assert!(!alice.zone.records.is_empty(), "precondition: alice has records");
+    let alice_seq = alice.zone.records.seq();
+
+    // Finalize WITHOUT upgrading the commitment — only a fresher anchor + empty
+    // records, same controlling key (mirrors a sub-handle finalize on the wire).
+    let mut zone = alice.zone.clone();
+    zone.anchor = alice.zone.anchor + 1;
+    zone.records = Default::default();
+    let alice_final = HandleRecord {
+        cert: alice.cert.clone(),
+        zone,
+        epoch_height: alice.epoch_height + 1,
+        offchain_seq: 0,
+        delegate_offchain_seq: alice.delegate_offchain_seq,
+    };
+
+    // The exact trap: is_better_than rejects this update (empty records lose
+    // before the anchor tiebreaker), so plain is_better_than gating would drop it.
+    assert!(
+        !alice_final.zone.is_better_than(&alice.zone).unwrap(),
+        "precondition: is_better_than rejects the empty-records fresher proof"
+    );
+
+    handler.store.update_handles(&[alice_final]).unwrap();
+    let after = handler
+        .store
+        .get_handle("alice@sovereign")
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        after.zone.anchor,
+        alice.zone.anchor + 1,
+        "the fresher-anchor finalize must replace the stale temp"
+    );
+    assert!(
+        !after.zone.records.is_empty() && after.zone.records.seq() == alice_seq,
+        "the owner's records must be preserved across the finalize"
+    );
+}
+
 #[test]
 fn test_all_fixtures() {
     let fixtures: Vec<(&str, Fixture, Vec<&str>)> = vec![
