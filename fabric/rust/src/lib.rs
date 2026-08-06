@@ -102,6 +102,18 @@ pub struct AnchorSet {
     pub entries: Vec<RootAnchor>,
 }
 
+impl AnchorSet {
+    /// Height of the newest anchor. Entries are canonically ordered
+    /// newest-first: the order is load-bearing because `compute_trust_set`
+    /// hashes the anchors in sequence to derive the trust id, so relays and
+    /// clients must agree on it (and the client sorts `Reverse(height)`). The
+    /// tip is therefore the first entry — `.last()` was the bug, returning the
+    /// OLDEST anchor in the window.
+    pub fn tip_height(&self) -> u32 {
+        self.entries.first().map(|a| a.block.height).unwrap_or(0)
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct SpaceHint {
     pub epoch_tip: u32,
