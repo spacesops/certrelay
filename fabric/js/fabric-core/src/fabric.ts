@@ -19,6 +19,16 @@ export interface FabricOptions {
   preferLatest?: boolean;
 }
 
+/** Per-call resolve options. */
+export interface ResolveOptions {
+  /**
+   * Bypass the zone cache (no read, no seed, no write) and fetch with
+   * `cache: "no-store"` so the browser/RN HTTP cache and any proxy don't serve
+   * a cached copy. Use right after writing records to read your own write.
+   */
+  noCache?: boolean;
+}
+
 export interface PeerInfo {
   source_ip: string;
   url: string;
@@ -473,8 +483,8 @@ export class Fabric {
   // ── Resolution ──
 
   /** Resolve a single handle. Returns null if not found. Supports nested names like `hello.alice@bitcoin`. */
-  async resolve(handle: string): Promise<FabricZone | null> {
-    const zones = await this.resolveAll([handle]);
+  async resolve(handle: string, opts?: ResolveOptions): Promise<FabricZone | null> {
+    const zones = await this.resolveAll([handle], opts);
     return zones.find((z) => z.handle === handle) ?? null;
   }
 
@@ -566,7 +576,7 @@ export class Fabric {
   }
 
   /** Resolve multiple handles, including nested names like `hello.alice@bitcoin`. */
-  async resolveAll(handles: string[]): Promise<FabricZone[]> {
+  async resolveAll(handles: string[], opts?: ResolveOptions): Promise<FabricZone[]> {
     const lookup = this.provider.createLookup(handles);
     const allZones: FabricZone[] = [];
 
@@ -574,7 +584,7 @@ export class Fabric {
     let batch = lookup.start();
     while (batch.length > 0) {
       if (arraysEqual(batch, prevBatch)) break;
-      const verified = await this.resolveFlat(batch);
+      const verified = await this.resolveFlat(batch, true, opts);
       const zones = verified.zones();
       prevBatch = batch;
       batch = lookup.advance(zones);
@@ -604,7 +614,11 @@ export class Fabric {
   }
 
   /** Resolve a flat list of non-dotted handles in a single relay query. */
-  private async resolveFlat(handles: string[], hints = true): Promise<VerifiedMessageHandle> {
+  private async resolveFlat(
+    handles: string[],
+    hints = true,
+    opts?: ResolveOptions,
+  ): Promise<VerifiedMessageHandle> {
     const bySpace = new Map<string, string[]>();
     for (const h of handles) {
       const { space, label } = parseHandle(h);
@@ -616,7 +630,8 @@ export class Fabric {
     const queries: Query[] = [];
     for (const [space, labels] of bySpace) {
       const q: Query = { space, handles: labels };
-      if (hints) {
+      // Cached epoch hint is a cache read — skip it under noCache.
+      if (hints && !opts?.noCache) {
         const cached = this.zoneCache.get(space);
         if (cached) {
           const json = cached.zone.toJson();
@@ -632,32 +647,40 @@ export class Fabric {
     }
 
     const request: QueryRequest = { queries };
-    return this.query(request);
+    return this.query(request, opts);
   }
 
-  private async query(request: QueryRequest): Promise<VerifiedMessageHandle> {
+  private async query(
+    request: QueryRequest,
+    opts?: ResolveOptions,
+  ): Promise<VerifiedMessageHandle> {
     await this.bootstrap();
 
     const ctx = this.provider.createQueryContext();
-    for (const q of request.queries) {
-      const cached = this.zoneCache.get(q.space);
-      if (cached) {
-        ctx.addZone(cached.bytes);
+    // Seed verification from cached zones unless bypassing the cache.
+    if (!opts?.noCache) {
+      for (const q of request.queries) {
+        const cached = this.zoneCache.get(q.space);
+        if (cached) {
+          ctx.addZone(cached.bytes);
+        }
       }
     }
 
     const relays = this.preferLatest
-      ? await this.pickRelays(request, 4)
+      ? await this.pickRelays(request, 4, opts)
       : this.pool.shuffledUrls(4);
 
-    const verified = await this.sendQuery(ctx, request, relays);
+    const verified = await this.sendQuery(ctx, request, relays, opts);
     const zones = verified.zones();
 
-    // Cache root zones (spaces like "@bitcoin" or "#12-12")
-    for (const zone of zones) {
-      const handle = zone.handle;
-      if (handle.startsWith("@") || handle.startsWith("#")) {
-        this.zoneCache.set(handle, { bytes: zone.toBytes(), zone });
+    // Cache root zones (spaces like "@bitcoin" or "#12-12") unless bypassing.
+    if (!opts?.noCache) {
+      for (const zone of zones) {
+        const handle = zone.handle;
+        if (handle.startsWith("@") || handle.startsWith("#")) {
+          this.zoneCache.set(handle, { bytes: zone.toBytes(), zone });
+        }
       }
     }
 
@@ -668,6 +691,7 @@ export class Fabric {
     ctx: QueryContextHandle,
     request: QueryRequest,
     relays: string[],
+    opts?: ResolveOptions,
   ): Promise<VerifiedMessageHandle> {
     // Build QueryContext with all requested handles
     for (const q of request.queries) {
@@ -700,7 +724,8 @@ export class Fabric {
           queryUrl += `&hints=${encodeURIComponent(hintParts.join(","))}`;
         }
 
-        const resp = await fetch(queryUrl);
+        // no-store defeats the browser/RN HTTP cache and any proxy.
+        const resp = await fetch(queryUrl, opts?.noCache ? { cache: "no-store" } : undefined);
 
         if (!resp.ok) {
           const body = await resp.text();
@@ -744,6 +769,7 @@ export class Fabric {
   private async pickRelays(
     request: QueryRequest,
     count: number,
+    opts?: ResolveOptions,
   ): Promise<string[]> {
     const hintsQuery = hintsQueryString(request);
     const shuffled = this.pool.shuffledUrls();
@@ -757,6 +783,7 @@ export class Fabric {
         batch.map(async (url) => {
           const resp = await fetch(
             `${url}/hints?q=${encodeURIComponent(hintsQuery)}`,
+            opts?.noCache ? { cache: "no-store" } : undefined,
           );
           if (!resp.ok) return null;
           const hints: HintsResponse = await resp.json();

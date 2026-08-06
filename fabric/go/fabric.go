@@ -426,9 +426,23 @@ func (f *Fabric) updateAnchors(trustID string, kind trustKind) error {
 	return nil
 }
 
+// ResolveOptions configures a single resolve call.
+type ResolveOptions struct {
+	// NoCache bypasses the client's in-memory zone cache and instructs any
+	// intermediary HTTP caches (proxies/CDNs) not to serve a possibly-stale
+	// copy. Use it to read your own writes immediately after publishing.
+	// When false (the default) behavior is unchanged.
+	NoCache bool
+}
+
 // Resolve a single handle. Returns nil if not found. Supports dotted names like "hello.alice@bitcoin".
 func (f *Fabric) Resolve(handle string) (*libveritas.Zone, error) {
-	zones, err := f.ResolveAll([]string{handle})
+	return f.ResolveWithOptions(handle, ResolveOptions{})
+}
+
+// ResolveWithOptions is like Resolve but accepts per-call options.
+func (f *Fabric) ResolveWithOptions(handle string, opts ResolveOptions) (*libveritas.Zone, error) {
+	zones, err := f.ResolveAllWithOptions([]string{handle}, opts)
 	if err != nil {
 		return nil, err
 	}
@@ -573,6 +587,11 @@ func (f *Fabric) SearchAddr(name, addr string) ([]libveritas.Zone, error) {
 
 // ResolveAll resolves multiple handles including dotted names.
 func (f *Fabric) ResolveAll(handles []string) ([]libveritas.Zone, error) {
+	return f.ResolveAllWithOptions(handles, ResolveOptions{})
+}
+
+// ResolveAllWithOptions is like ResolveAll but accepts per-call options.
+func (f *Fabric) ResolveAllWithOptions(handles []string, opts ResolveOptions) ([]libveritas.Zone, error) {
 	lookup, err := libveritas.NewLookup(handles)
 	if err != nil {
 		return nil, fmt.Errorf("creating lookup: %w", err)
@@ -586,7 +605,7 @@ func (f *Fabric) ResolveAll(handles []string) ([]libveritas.Zone, error) {
 		if slicesEqual(batch, prevBatch) {
 			break
 		}
-		verified, err := f.resolveFlat(batch, true)
+		verified, err := f.resolveFlat(batch, true, opts)
 		if err != nil {
 			return nil, err
 		}
@@ -624,7 +643,7 @@ func (f *Fabric) Export(handle string) ([]byte, error) {
 		if slicesEqual(batch, prevBatch) {
 			break
 		}
-		verified, err := f.resolveFlat(batch, false)
+		verified, err := f.resolveFlat(batch, false, ResolveOptions{})
 		if err != nil {
 			return nil, err
 		}
@@ -694,7 +713,7 @@ func (f *Fabric) Publish(cert []byte, records []byte, secretKey []byte, primary 
 	return f.Broadcast(msg)
 }
 
-func (f *Fabric) resolveFlat(handles []string, hints bool) (*libveritas.VerifiedMessage, error) {
+func (f *Fabric) resolveFlat(handles []string, hints bool, opts ResolveOptions) (*libveritas.VerifiedMessage, error) {
 	bySpace := make(map[string][]string)
 	for _, h := range handles {
 		space, label := parseHandle(h)
@@ -704,7 +723,9 @@ func (f *Fabric) resolveFlat(handles []string, hints bool) (*libveritas.Verified
 	var queries []Query
 	for space, labels := range bySpace {
 		q := Query{Space: space, Handles: labels}
-		if hints {
+		// Seed an epoch hint from the zone cache unless the caller asked to
+		// bypass it (noCache reads must not be biased toward stale state).
+		if hints && !opts.NoCache {
 			f.mu.Lock()
 			if cached, ok := f.zoneCache[space]; ok {
 				if hint := epochHintFromZone(cached); hint != nil {
@@ -716,50 +737,56 @@ func (f *Fabric) resolveFlat(handles []string, hints bool) (*libveritas.Verified
 		queries = append(queries, q)
 	}
 
-	return f.query(QueryRequest{Queries: queries})
+	return f.query(QueryRequest{Queries: queries}, opts)
 }
 
-func (f *Fabric) query(request QueryRequest) (*libveritas.VerifiedMessage, error) {
+func (f *Fabric) query(request QueryRequest, opts ResolveOptions) (*libveritas.VerifiedMessage, error) {
 	if err := f.Bootstrap(); err != nil {
 		return nil, err
 	}
 
 	ctx := libveritas.NewQueryContext()
-	f.mu.Lock()
-	for _, q := range request.Queries {
-		if cached, ok := f.zoneCache[q.Space]; ok {
-			if b, err := libveritas.ZoneToBytes(cached); err == nil {
-				ctx.AddZone(b)
+	// Seed the verification context from the zone cache unless bypassing it.
+	if !opts.NoCache {
+		f.mu.Lock()
+		for _, q := range request.Queries {
+			if cached, ok := f.zoneCache[q.Space]; ok {
+				if b, err := libveritas.ZoneToBytes(cached); err == nil {
+					ctx.AddZone(b)
+				}
 			}
 		}
+		f.mu.Unlock()
 	}
-	f.mu.Unlock()
 
 	var relays []string
 	if f.preferLatest {
-		relays = f.pickRelays(request, 4)
+		relays = f.pickRelays(request, 4, opts)
 	} else {
 		relays = f.pool.ShuffledURLs(4)
 	}
 
-	verified, err := f.sendQuery(ctx, request, relays)
+	verified, err := f.sendQuery(ctx, request, relays, opts)
 	if err != nil {
 		return nil, err
 	}
 
-	zones := verified.Zones()
-	f.mu.Lock()
-	for _, z := range zones {
-		if strings.HasPrefix(z.Handle, "@") || strings.HasPrefix(z.Handle, "#") {
-			f.zoneCache[z.Handle] = z
+	// Don't write fresh responses into the zone cache under noCache.
+	if !opts.NoCache {
+		zones := verified.Zones()
+		f.mu.Lock()
+		for _, z := range zones {
+			if strings.HasPrefix(z.Handle, "@") || strings.HasPrefix(z.Handle, "#") {
+				f.zoneCache[z.Handle] = z
+			}
 		}
+		f.mu.Unlock()
 	}
-	f.mu.Unlock()
 
 	return verified, nil
 }
 
-func (f *Fabric) sendQuery(ctx *libveritas.QueryContext, request QueryRequest, relays []string) (*libveritas.VerifiedMessage, error) {
+func (f *Fabric) sendQuery(ctx *libveritas.QueryContext, request QueryRequest, relays []string, opts ResolveOptions) (*libveritas.VerifiedMessage, error) {
 	var qParts []string
 	var hintParts []string
 	for _, q := range request.Queries {
@@ -787,7 +814,7 @@ func (f *Fabric) sendQuery(ctx *libveritas.QueryContext, request QueryRequest, r
 		}
 		queryURL.RawQuery = params.Encode()
 
-		resp, err := f.client.Get(queryURL.String())
+		resp, err := httpGet(f.client, queryURL.String(), opts.NoCache)
 		if err != nil {
 			f.pool.MarkFailed(u)
 			lastErr = &FabricError{Code: "http", Message: err.Error()}
@@ -833,7 +860,7 @@ func (f *Fabric) sendQuery(ctx *libveritas.QueryContext, request QueryRequest, r
 	return nil, lastErr
 }
 
-func (f *Fabric) pickRelays(request QueryRequest, count int) []string {
+func (f *Fabric) pickRelays(request QueryRequest, count int, opts ResolveOptions) []string {
 	hintsQuery := hintsQueryString(request)
 	shuffled := f.pool.ShuffledURLs(0)
 
@@ -860,7 +887,7 @@ func (f *Fabric) pickRelays(request QueryRequest, count int) []string {
 		ch := make(chan result, len(batch))
 		for _, u := range batch {
 			go func(u string) {
-				h, err := fetchHints(f.client, u, hintsQuery)
+				h, err := fetchHints(f.client, u, hintsQuery, opts.NoCache)
 				if err != nil {
 					ch <- result{url: u}
 					return
@@ -1075,10 +1102,10 @@ func fetchPeers(client *http.Client, relayURL string) ([]PeerInfo, error) {
 	return peers, nil
 }
 
-func fetchHints(client *http.Client, relayURL, query string) (*HintsResponse, error) {
+func fetchHints(client *http.Client, relayURL, query string, noCache bool) (*HintsResponse, error) {
 	u, _ := url.Parse(relayURL + "/hints")
 	u.RawQuery = url.Values{"q": {query}}.Encode()
-	resp, err := client.Get(u.String())
+	resp, err := httpGet(client, u.String(), noCache)
 	if err != nil {
 		return nil, err
 	}
@@ -1091,6 +1118,20 @@ func fetchHints(client *http.Client, relayURL, query string) (*HintsResponse, er
 		return nil, err
 	}
 	return &hints, nil
+}
+
+// httpGet performs a GET request, adding no-cache request headers when noCache
+// is set so intermediary proxies/CDNs don't serve a cached (max-age) copy.
+func httpGet(client *http.Client, rawURL string, noCache bool) (*http.Response, error) {
+	req, err := http.NewRequest(http.MethodGet, rawURL, nil)
+	if err != nil {
+		return nil, err
+	}
+	if noCache {
+		req.Header.Set("Cache-Control", "no-cache")
+		req.Header.Set("Pragma", "no-cache")
+	}
+	return client.Do(req)
 }
 
 func postJSON(client *http.Client, url string, body []byte) ([]byte, error) {

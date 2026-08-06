@@ -569,6 +569,43 @@ async fn handle_peers(
 ///   `q` — comma-separated handles (e.g. `alice@bitcoin,bob@bitcoin,@bitcoin`)
 ///   `hints` — optional comma-separated epoch hints (e.g. `@bitcoin:abcdef:870000`)
 /// Returns: binary borsh-encoded Message with certificates and proofs
+/// Whether an `If-None-Match` header matches our ETag (handles lists, `*`, and
+/// weak `W/` prefixes).
+fn etag_matches(if_none_match: &str, etag: &str) -> bool {
+    if_none_match == "*"
+        || if_none_match.split(',').any(|t| {
+            let t = t.trim();
+            t == etag || t.strip_prefix("W/").map(|w| w.trim() == etag).unwrap_or(false)
+        })
+}
+
+/// Cheap content version for a `/query` response: hashes each covered handle's
+/// stored `zone_hash` (parent spaces + requested sub-handles). It changes on
+/// create / delete / record / commitment updates but NOT merely because a new
+/// block re-anchored the proof — so an unchanged query can answer `304` and skip
+/// proof generation, while the client's older-but-still-valid proof stays usable
+/// (anchors are cumulative). Returns `None` if the version lookup fails.
+fn query_etag(store: &crate::store::SqliteStore, sorted_handles: &[String]) -> Option<String> {
+    use sha2::Digest;
+    let refs: Vec<&str> = sorted_handles.iter().map(|s| s.as_str()).collect();
+    let rows = store.get_handle_hints(&refs).ok()?;
+    let present: HashMap<&str, &[u8]> = rows
+        .iter()
+        .map(|r| (r.handle.as_str(), r.zone_hash.as_slice()))
+        .collect();
+    let mut h = sha2::Sha256::new();
+    for handle in sorted_handles {
+        h.update(handle.as_bytes());
+        h.update([0u8]);
+        match present.get(handle.as_str()) {
+            Some(zh) => h.update(zh),
+            None => h.update(b"absent"),
+        }
+        h.update([0xffu8]);
+    }
+    Some(format!("\"{}\"", hex::encode(h.finalize())))
+}
+
 async fn handle_query(
     State(state): State<Arc<AppState>>,
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
@@ -576,8 +613,11 @@ async fn handle_query(
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
     let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.proof.check_key(&ip).is_err() {
-        crate::stats::bump(&state.stats.rl_proof);
+    // Cheap read gate covers every /query — including conditional 304s and the
+    // zone-hash lookup below. Proof generation has its own stricter gate,
+    // charged only on a cache miss just before the proof is built.
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
 
@@ -646,6 +686,21 @@ async fn handle_query(
         by_space.entry(space).or_default().push(label);
     }
 
+    // Content version (parent spaces + requested sub-handles) for conditional
+    // requests. Computed from cheap zone_hash lookups, before proof generation.
+    let mut version_handles: Vec<String> = Vec::new();
+    for (space, labels) in &by_space {
+        version_handles.push(space.clone());
+        for l in labels {
+            if !l.is_empty() {
+                version_handles.push(format!("{l}{space}"));
+            }
+        }
+    }
+    version_handles.sort();
+    version_handles.dedup();
+    let etag = query_etag(&state.handler.store, &version_handles);
+
     let queries: Vec<Query> = by_space
         .into_iter()
         .map(|(space, labels)| {
@@ -659,7 +714,30 @@ async fn handle_query(
         .collect();
 
     let mut resp_headers = HeaderMap::new();
-    resp_headers.insert("cache-control", "public, max-age=300".parse().unwrap());
+    // Short TTL: an unchanged repeat within the window is served from the
+    // client's cache with no request; after it lapses the ETag makes
+    // revalidation cheap — a 304 skips proof generation entirely.
+    resp_headers.insert("cache-control", "public, max-age=5".parse().unwrap());
+    if let Some(ref etag) = etag {
+        if let Ok(v) = etag.parse() {
+            resp_headers.insert("etag", v);
+        }
+        // If the covered zones are unchanged, don't regenerate the proof.
+        if headers
+            .get("if-none-match")
+            .and_then(|v| v.to_str().ok())
+            .is_some_and(|inm| etag_matches(inm, etag))
+        {
+            return (StatusCode::NOT_MODIFIED, resp_headers).into_response();
+        }
+    }
+
+    // Cache miss: this request will generate a proof, so charge the stricter
+    // proof budget now (304s and cache hits above never reach here).
+    if state.limiters.proof.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_proof);
+        return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
+    }
 
     // Global proof cap: shed load instead of queueing proof generation
     let Ok(_permit) = state.proof_sem.try_acquire() else {
@@ -702,7 +780,9 @@ async fn handle_anchors(
 
     let mut headers = HeaderMap::new();
     if let Some(latest) = store.latest() {
-        let height = latest.entries.last().map(|a| a.block.height).unwrap_or(0);
+        // Anchors are canonically newest-first, so the tip is the first entry.
+        // `.last()` here reported the oldest anchor in the window as the height.
+        let height = latest.tip_height();
         let trust_set = libveritas::compute_trust_set(&latest.entries);
         if let Ok(v) = hex::encode(trust_set.id).parse() {
             headers.insert("x-anchor-root", v);
@@ -772,7 +852,11 @@ async fn handle_hints(
     match state.handler.hints(&mut handles) {
         Ok(res) => {
             let mut headers = HeaderMap::new();
-            headers.insert("cache-control", "public, max-age=300".parse().unwrap());
+            // The freshness oracle. A short 5s TTL matches /query and sheds
+            // repeat load, while keeping staleness small enough that a hint
+            // won't mask a change for long (was 300s, which defeated ranking
+            // and /query's ETag revalidation).
+            headers.insert("cache-control", "public, max-age=5".parse().unwrap());
             (headers, axum::Json(res)).into_response()
         }
         Err(e) => {
@@ -1082,4 +1166,48 @@ pub async fn bootstrap_from(
     }
 
     Ok(peers)
+}
+
+#[cfg(test)]
+mod etag_tests {
+    use super::{etag_matches, query_etag};
+    use crate::store::SqliteStore;
+
+    #[test]
+    fn etag_matches_handles_lists_star_and_weak() {
+        assert!(etag_matches("\"abc\"", "\"abc\""));
+        assert!(etag_matches("*", "\"abc\""));
+        assert!(etag_matches("W/\"abc\"", "\"abc\""));
+        assert!(etag_matches("\"x\", \"abc\"", "\"abc\""));
+        assert!(!etag_matches("\"xyz\"", "\"abc\""));
+        assert!(!etag_matches("", "\"abc\""));
+    }
+
+    // The version must change on create/update/delete of a covered zone, and be
+    // stable when nothing changed — that's what makes 304s both safe and useful.
+    #[test]
+    fn etag_busts_on_create_update_delete() {
+        let store = SqliteStore::in_memory().unwrap();
+        let covered = vec!["@t".to_string(), "a@t".to_string()];
+
+        store.test_insert("@t", "@t", 100, b"parent-v1");
+        let absent = query_etag(&store, &covered).unwrap();
+
+        // create the sub-handle
+        store.test_insert("a@t", "@t", 100, b"a-v1");
+        let present = query_etag(&store, &covered).unwrap();
+        assert_ne!(absent, present, "create must bust the ETag");
+
+        // update its zone (e.g. new records) -> different zone_hash
+        store.test_insert("a@t", "@t", 100, b"a-v2");
+        let updated = query_etag(&store, &covered).unwrap();
+        assert_ne!(present, updated, "update must bust the ETag");
+
+        // nothing changed -> stable (this is where the 304 win comes from)
+        assert_eq!(updated, query_etag(&store, &covered).unwrap());
+
+        // delete -> back to the absent version
+        store.delete_handles(&["a@t".to_string()]).unwrap();
+        assert_eq!(absent, query_etag(&store, &covered).unwrap());
+    }
 }
