@@ -133,6 +133,14 @@ fn log_startup_env(args: &Args, data_dir: &Path) {
         "  CERTRELAY_ANCHOR_REFRESH   = {}s",
         args.anchor_refresh
     );
+    eprintln!(
+        "  CERTRELAY_SEEDS            = {}",
+        if args.seeds.is_empty() {
+            "<builtin mainnet / none off-mainnet>".to_string()
+        } else {
+            args.seeds.join(",")
+        }
+    );
     eprintln!("  --skip-checkpoint-sync     = {}", args.skip_checkpoint_sync);
     eprintln!(
         "  CERTRELAY_ALLOW_PRIVATE_PEERS = {}",

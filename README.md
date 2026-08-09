@@ -45,6 +45,7 @@ No external Bitcoin node required. Data is stored in `~/.certrelay` by default.
 | `--spaced-rpc-url` | `CERTRELAY_SPACED_RPC_URL` | - | External spaced RPC (skips embedded node) |
 | `--remote-ip-header` | `CERTRELAY_REMOTE_IP_HEADER` | - | Header for client IP behind reverse proxy (rightmost entry is used) |
 | `--is-bootstrap` | `CERTRELAY_BOOTSTRAP` | `false` | Run as a bootstrap node |
+| `--seed` | `CERTRELAY_SEEDS` | mainnet builtins / none off-mainnet | Override bootstrap seeds (repeatable or comma-separated; replaces builtins) |
 | `--anchor-refresh` | `CERTRELAY_ANCHOR_REFRESH` | `300` | Anchor refresh interval in seconds |
 | `--allow-private-peers` | `CERTRELAY_ALLOW_PRIVATE_PEERS` | `false` | Accept peers on private/loopback addresses (local development only) |
 | `--skip-checkpoint-sync` | - | `false` | Skip checkpoint download, sync from scratch |

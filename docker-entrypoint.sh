@@ -55,6 +55,8 @@ certrelay: starting with effective configuration
   CERTRELAY_REMOTE_IP_HEADER = ${CERTRELAY_REMOTE_IP_HEADER:-<unset>}
   CERTRELAY_BOOTSTRAP        = ${CERTRELAY_BOOTSTRAP}
   CERTRELAY_ANCHOR_REFRESH   = ${CERTRELAY_ANCHOR_REFRESH}
+  CERTRELAY_SEEDS            = ${CERTRELAY_SEEDS:-<builtin mainnet / none off-mainnet>}
+  CERTRELAY_CONFIG           = ${CERTRELAY_CONFIG:-<unset>}
   RUST_LOG                   = ${RUST_LOG:-info}
 EOF
 
