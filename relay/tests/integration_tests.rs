@@ -418,6 +418,65 @@ fn test_finalize_without_commitment_upgrade_replaces_temp() {
     );
 }
 
+/// A root cert re-sent for the same commitment often omits its ZK receipt (the
+/// sender assumes the relay still holds it). `is_better_than` accepts the
+/// fresher-anchor cert, and without preservation the receipt-less cert would
+/// overwrite the receipt-bearing one — leaving the relay unable to prove the
+/// commitment to any fresh client, so sub-handles fail with "receipt required".
+/// The store must keep the existing receipt. Regression for the `@test10000` case.
+#[test]
+fn test_receiptless_root_update_preserves_receipt() {
+    use libveritas::cert::Witness;
+    use relay::store::HandleRecord;
+
+    // A second commitment proves a transition from the first, so its root cert
+    // carries a ZK receipt (a first commit has nothing to prove and omits it).
+    let mut state = ChainState::new();
+    let mut runner = FixtureRunner::new(&mut state, two_commits_both_finalized());
+    runner.run(&mut state);
+    let handler = setup_handler(&state);
+    let bundle = runner.build_bundle();
+    let msg = state.message(vec![bundle]);
+    handler.handle_message(msg).unwrap();
+
+    let root = handler.store.get_handle("@two-finalized").unwrap().unwrap();
+    assert!(
+        matches!(root.cert.witness, Witness::Root { receipt: Some(_) }),
+        "precondition: the stored root cert carries a receipt"
+    );
+
+    // Re-send the root proven against a fresher anchor but with the receipt
+    // omitted, same commitment and key.
+    let mut cert = root.cert.clone();
+    if let Witness::Root { receipt } = &mut cert.witness {
+        *receipt = None;
+    }
+    let mut zone = root.zone.clone();
+    zone.anchor += 1;
+    let update = HandleRecord {
+        cert,
+        zone,
+        epoch_height: root.epoch_height,
+        offchain_seq: root.offchain_seq,
+        delegate_offchain_seq: root.delegate_offchain_seq,
+    };
+    // The fresher-anchor cert IS accepted by is_better_than — that's the trap.
+    assert!(update.zone.is_better_than(&root.zone).unwrap());
+
+    handler.store.update_handles(&[update]).unwrap();
+
+    let after = handler.store.get_handle("@two-finalized").unwrap().unwrap();
+    assert!(
+        matches!(after.cert.witness, Witness::Root { receipt: Some(_) }),
+        "the receipt must survive a receipt-less re-send for the same commitment"
+    );
+    assert_eq!(
+        after.zone.anchor,
+        root.zone.anchor + 1,
+        "the zone still updates to the fresher anchor"
+    );
+}
+
 #[test]
 fn test_all_fixtures() {
     let fixtures: Vec<(&str, Fixture, Vec<&str>)> = vec![
