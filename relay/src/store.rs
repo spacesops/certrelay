@@ -5,8 +5,9 @@ use std::path::Path;
 use std::sync::Mutex;
 
 use anyhow::anyhow;
+use libveritas::ProvableOption;
 use libveritas::Zone;
-use libveritas::cert::Certificate;
+use libveritas::cert::{Certificate, Witness};
 use resolver::ReverseRecord;
 use rusqlite::{Connection, OptionalExtension, params};
 use spaces_protocol::slabel::SLabel;
@@ -173,6 +174,18 @@ fn sovereignty_rank(s: libveritas::SovereigntyState) -> u8 {
     }
 }
 
+/// Whether two zones carry the same on-chain commitment (Exists, equal state
+/// root) — so a receipt verified for one still proves the other.
+fn same_commitment_root(a: &Zone, b: &Zone) -> bool {
+    matches!(
+        (&a.commitment, &b.commitment),
+        (
+            ProvableOption::Exists { value: x },
+            ProvableOption::Exists { value: y },
+        ) if x.onchain.state_root == y.onchain.state_root
+    )
+}
+
 /// SQLite-backed store for handles.
 pub struct SqliteStore {
     conn: Mutex<Connection>,
@@ -316,6 +329,9 @@ impl SqliteStore {
             epoch_height: u32,
             offchain_seq: u64,
             delegate_offchain_seq: u64,
+            /// Keep the existing stored cert_data instead of this update's cert
+            /// (its receipt was omitted; see the preservation note below).
+            preserve_cert: bool,
         }
 
         let mut entries = Vec::with_capacity(updates.len());
@@ -339,6 +355,7 @@ impl SqliteStore {
                 epoch_height: update.epoch_height,
                 offchain_seq: update.offchain_seq,
                 delegate_offchain_seq: update.delegate_offchain_seq,
+                preserve_cert: false,
             });
         }
 
@@ -427,6 +444,21 @@ impl SqliteStore {
                     }
                 }
 
+                // Preserve the ZK receipt: a root cert re-sent for the same
+                // commitment often omits it (the sender assumes we still hold
+                // it), which would leave us serving a receipt-less cert that no
+                // sub-handle can verify against the tip. Keep our existing
+                // cert_data (the zone still updates to the fresher anchor above;
+                // only the cert, and its receipt, is retained). Same commitment
+                // root is the safe condition: a receipt-less cert only reaches
+                // here if we already verified that commitment. The insert reads
+                // the existing cert_data in-place, so no extra fetch is needed.
+                if matches!(&update.cert.witness, Witness::Root { receipt: None })
+                    && same_commitment_root(&update.zone, existing)
+                {
+                    e.preserve_cert = true;
+                }
+
                 Some(e)
             })
             .collect();
@@ -453,10 +485,21 @@ impl SqliteStore {
             params![seq_base + to_store.len() as i64],
         )?;
 
-        // Bulk INSERT
+        // Bulk INSERT. For preserve_cert rows the cert_data column reads the
+        // existing stored value in-place (keeping its ZK receipt) rather than
+        // taking this update's receipt-less cert; the zone still updates. The
+        // subquery runs before REPLACE deletes the old row, and since the value
+        // is unchanged the storage-byte trigger nets out on cert_data.
         let placeholders: Vec<String> = to_store
             .iter()
-            .map(|_| "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string())
+            .map(|e| {
+                if e.preserve_cert {
+                    "(?, ?, (SELECT cert_data FROM handles WHERE handle = ?), ?, ?, ?, ?, ?, ?, ?)"
+                        .to_string()
+                } else {
+                    "(?, ?, ?, ?, ?, ?, ?, ?, ?, ?)".to_string()
+                }
+            })
             .collect();
         let query = format!(
             "INSERT OR REPLACE INTO handles (handle, space, cert_data, zone_data, epoch_height, offchain_seq, delegate_offchain_seq, sync_seq, zone_hash, updated_at) VALUES {}",
@@ -467,7 +510,13 @@ impl SqliteStore {
         for (i, e) in to_store.iter().enumerate() {
             params.push(Box::new(e.handle.clone()));
             params.push(Box::new(e.space.clone()));
-            params.push(Box::new(e.cert_data.clone()));
+            // cert_data: bind the handle for the SELECT subquery when preserving,
+            // otherwise this update's cert bytes.
+            if e.preserve_cert {
+                params.push(Box::new(e.handle.clone()));
+            } else {
+                params.push(Box::new(e.cert_data.clone()));
+            }
             params.push(Box::new(e.zone_data.clone()));
             params.push(Box::new(e.epoch_height));
             params.push(Box::new(e.offchain_seq as i64));
