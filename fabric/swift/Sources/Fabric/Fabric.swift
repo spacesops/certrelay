@@ -136,6 +136,17 @@ public struct ScanParams {
     }
 }
 
+/// A resolved handle plus its exportable cert chain and parent-space context.
+public struct ResolvedWithCerts {
+    /// The resolved leaf zone.
+    public let zone: Zone
+    /// Parent-space zones ordered `[parent, grandparent, ..., top-level space]`.
+    /// Each carries its own commitment/sovereignty.
+    public let parents: [Zone]
+    /// The full certificate chain in `.spacecert` format.
+    public let certs: Data
+}
+
 // MARK: - Fabric client
 
 public final class Fabric: @unchecked Sendable {
@@ -442,6 +453,40 @@ public final class Fabric: @unchecked Sendable {
         }
 
         return try createCertificateChain(subject: handle, certBytesList: allCertBytes)
+    }
+
+    /// Resolve a handle and export its certificate chain in one pass, also
+    /// surfacing each parent space's zone (commitment/finality). Returns nil if
+    /// the handle doesn't resolve.
+    public func resolveWithCerts(_ handle: String, noCache: Bool = false) async throws -> ResolvedWithCerts? {
+        let lookup = try Lookup(names: [handle])
+        var allZones = [Zone]()
+        var allCertBytes = [Data]()
+
+        var prevBatch = [String]()
+        var batch = lookup.start()
+        while !batch.isEmpty {
+            if batch == prevBatch { break }
+            // hints=false so the exported certs carry their receipts.
+            let verified = try await resolveFlat(batch, hints: false, noCache: noCache)
+            allCertBytes.append(contentsOf: verified.certificates())
+            let zones = verified.zones()
+            prevBatch = batch
+            batch = try lookup.advance(zones: zones)
+            allZones.append(contentsOf: zones)
+        }
+
+        let expanded = try lookup.expandZones(zones: allZones)
+        guard let leaf = expanded.first(where: { $0.handle == handle }) else { return nil }
+
+        // Parent spaces (single-label handle @/#) other than the leaf, reversed
+        // for parent-first ordering.
+        let parents = expanded
+            .filter { ($0.handle.hasPrefix("@") || $0.handle.hasPrefix("#")) && $0.handle != leaf.handle }
+            .reversed()
+
+        let certs = try createCertificateChain(subject: handle, certBytesList: allCertBytes)
+        return ResolvedWithCerts(zone: leaf, parents: Array(parents), certs: certs)
     }
 
     // MARK: - Publish
