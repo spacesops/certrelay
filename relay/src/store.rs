@@ -401,13 +401,11 @@ impl SqliteStore {
                         // finality; the owner's records are preserved by the merge
                         // below. Incoming certs are already verified against current
                         // anchors, so a higher anchor is genuine fresher chain truth.
-                        let fresher_proof = update.zone.script_pubkey
-                            == existing.script_pubkey
+                        let fresher_proof = update.zone.script_pubkey == existing.script_pubkey
                             && update.zone.anchor > existing.anchor
                             && sovereignty_rank(update.zone.sovereignty)
                                 >= sovereignty_rank(existing.sovereignty);
-                        if !fresher_proof
-                            && !update.zone.is_better_than(existing).unwrap_or(false)
+                        if !fresher_proof && !update.zone.is_better_than(existing).unwrap_or(false)
                         {
                             return None; // stored zone is as good or better
                         }

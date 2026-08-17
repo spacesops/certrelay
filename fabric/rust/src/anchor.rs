@@ -47,8 +47,7 @@ mod tests {
     // Newest-first: entries[0].height = 6480 (tip), entries[59] = 4356 (oldest).
     const REAL: &str = include_str!("testdata/anchors_newest_first.json");
     // The X-Anchor-Root header the same relay served with this body.
-    const SERVED_ROOT: &str =
-        "7f20135af5fea06ac6a38303ea887428a614186979a41abde64e03ea6780375e";
+    const SERVED_ROOT: &str = "7f20135af5fea06ac6a38303ea887428a614186979a41abde64e03ea6780375e";
 
     #[test]
     fn tip_is_first_not_last_and_order_is_canonical() {

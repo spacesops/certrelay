@@ -29,6 +29,19 @@ export interface ResolveOptions {
   noCache?: boolean;
 }
 
+/** A resolved handle plus its exportable cert chain and parent-space context. */
+export interface ResolvedWithCerts {
+  /** The resolved leaf zone. */
+  zone: FabricZone;
+  /**
+   * Parent-space zones ordered `[parent, grandparent, …, top-level space]`.
+   * Each carries its own commitment/sovereignty (read via `toJson()`).
+   */
+  parents: FabricZone[];
+  /** The full certificate chain in `.spacecert` format. */
+  certs: Uint8Array;
+}
+
 export interface PeerInfo {
   source_ip: string;
   url: string;
@@ -611,6 +624,49 @@ export class Fabric {
     }
 
     return this.provider.createCertificateChain(handle, allCertBytes);
+  }
+
+  /**
+   * Resolve a handle and export its cert chain in one pass, also surfacing each
+   * parent space's zone (commitment/finality). Returns null if not found.
+   */
+  async resolveWithCerts(
+    handle: string,
+    opts?: ResolveOptions,
+  ): Promise<ResolvedWithCerts | null> {
+    const lookup = this.provider.createLookup([handle]);
+    const allZones: FabricZone[] = [];
+    const allCertBytes: Uint8Array[] = [];
+
+    let prevBatch: string[] = [];
+    let batch = lookup.start();
+    while (batch.length > 0) {
+      if (arraysEqual(batch, prevBatch)) break;
+      // hints=false so the exported certs carry their receipts.
+      const verified = await this.resolveFlat(batch, false, opts);
+      allCertBytes.push(...verified.certificates());
+      const zones = verified.zones();
+      prevBatch = batch;
+      batch = lookup.advance(zones);
+      allZones.push(...zones);
+    }
+
+    const expanded = lookup.expandZones(allZones);
+    const leaf = expanded.find((z) => z.handle === handle);
+    if (!leaf) return null;
+
+    // Space roots (canonical starts with @ or #) other than the leaf, resolved
+    // root→leaf; reverse for parent-first ordering.
+    const leafCanonical = leaf.toJson().canonical;
+    const parents = expanded
+      .filter((z) => {
+        const c = z.toJson().canonical;
+        return (c.startsWith("@") || c.startsWith("#")) && c !== leafCanonical;
+      })
+      .reverse();
+
+    const certs = this.provider.createCertificateChain(handle, allCertBytes);
+    return { zone: leaf, parents, certs };
   }
 
   /** Resolve a flat list of non-dotted handles in a single relay query. */

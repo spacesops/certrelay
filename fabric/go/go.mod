@@ -4,7 +4,7 @@ go 1.22
 
 require (
 	github.com/btcsuite/btcd/btcec/v2 v2.3.6
-	github.com/spacesprotocol/libveritas-go v0.3.3
+	github.com/spacesprotocol/libveritas-go v0.4.2
 )
 
 require (
