@@ -20,7 +20,7 @@ export type {
   EpochResult,
   HandleHint,
 } from "./hints.js";
-export { DEFAULT_SEEDS } from "./seeds.js";
+export { DEFAULT_SEEDS, DEFAULT_SEMI_TRUSTED } from "./seeds.js";
 export { wasmProvider, reactNativeProvider } from "./provider.js";
 export type {
   VeritasProvider,

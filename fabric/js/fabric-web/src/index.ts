@@ -55,6 +55,7 @@ export {
   RelayPool,
   compareHints,
   DEFAULT_SEEDS,
+  DEFAULT_SEMI_TRUSTED,
 } from "@spacesprotocol/fabric-core";
 
 export type {

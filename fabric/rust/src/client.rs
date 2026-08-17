@@ -1783,12 +1783,19 @@ mod semi_trust_tests {
     }
 
     #[test]
-    fn default_pool_is_empty_until_keys_published() {
-        // Keyless bootstrap relays don't belong in the set, so the default is
-        // empty and refresh is a safe no-op (quorum unreachable).
+    fn default_pool_pins_production_relays() {
+        // The default pool is our production relays with their advertised keys,
+        // under majority quorum. Every pinned key must parse (from_hex would
+        // have panicked in Default otherwise); assert the shape here.
         let config = SemiTrustConfig::default();
-        assert!(config.relays.is_empty());
+        assert_eq!(config.relays.len(), SEED_SEMI_TRUSTED.len());
+        assert!(!config.relays.is_empty());
         assert_eq!(config.quorum, Quorum::Majority);
+        for relay in &config.relays {
+            assert!(relay.url.starts_with("https://"));
+            // pubkey is [u8; 32]; from_hex validated it as a real x-only key.
+            assert_eq!(relay.pubkey_hex().len(), 64);
+        }
     }
 }
 
