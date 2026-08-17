@@ -378,7 +378,10 @@ fn test_finalize_without_commitment_upgrade_replaces_temp() {
         .get_handle("alice@sovereign")
         .unwrap()
         .unwrap();
-    assert!(!alice.zone.records.is_empty(), "precondition: alice has records");
+    assert!(
+        !alice.zone.records.is_empty(),
+        "precondition: alice has records"
+    );
     let alice_seq = alice.zone.records.seq();
 
     // Finalize WITHOUT upgrading the commitment — only a fresher anchor + empty

@@ -575,7 +575,10 @@ fn etag_matches(if_none_match: &str, etag: &str) -> bool {
     if_none_match == "*"
         || if_none_match.split(',').any(|t| {
             let t = t.trim();
-            t == etag || t.strip_prefix("W/").map(|w| w.trim() == etag).unwrap_or(false)
+            t == etag
+                || t.strip_prefix("W/")
+                    .map(|w| w.trim() == etag)
+                    .unwrap_or(false)
         })
 }
 

@@ -538,11 +538,7 @@ impl Fabric {
     }
 
     /// Like [`resolve`](Self::resolve) but with per-call options (e.g. `no_cache`).
-    pub async fn resolve_with_opts(
-        &self,
-        handle: &str,
-        opts: ResolveOpts,
-    ) -> Result<Option<Zone>> {
+    pub async fn resolve_with_opts(&self, handle: &str, opts: ResolveOpts) -> Result<Option<Zone>> {
         let zones = self.resolve_all_with_opts(&[handle], opts).await?;
         Ok(zones.into_iter().find(|z| z.handle.to_string() == handle))
     }
@@ -742,7 +738,11 @@ impl Fabric {
             .resolve_lookup(vec![sname.clone()], false, false, true)
             .await?;
 
-        let Some(leaf) = zones.iter().find(|z| z.handle.to_string() == handle).cloned() else {
+        let Some(leaf) = zones
+            .iter()
+            .find(|z| z.handle.to_string() == handle)
+            .cloned()
+        else {
             return Ok(None);
         };
         let parents = parent_zones(&zones, &leaf);
