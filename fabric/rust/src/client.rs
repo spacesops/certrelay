@@ -2,7 +2,7 @@ use crate::seeds::SEEDS;
 pub use crate::{
     AnchorSet, EpochHint, HintsResponse, Message, PeerInfo, Query, QueryRequest, TrustId,
 };
-use libveritas::cert::CertificateChain;
+use libveritas::cert::{Certificate, CertificateChain};
 use libveritas::msg::QueryContext;
 use libveritas::spaces_protocol::sname::{NameLike, SName};
 use libveritas::{
@@ -71,6 +71,32 @@ pub struct ResolveOpts {
     /// `Cache-Control: no-cache` so an HTTP cache / proxy doesn't serve a cached
     /// copy. Use right after writing records to read your own write immediately.
     pub no_cache: bool,
+}
+
+/// A resolved handle together with its exportable certificate chain and the
+/// commitment context of each parent space.
+#[derive(Clone, Serialize)]
+pub struct ResolvedWithCerts {
+    /// The resolved leaf zone.
+    pub zone: Zone,
+    /// Parent-space zones ordered `[parent, grandparent, …, top-level space]`.
+    /// Each carries its own `sovereignty` and `commitment` (height/roots), so a
+    /// finalized parent under a still-pending grandparent is fully represented.
+    pub parents: Vec<Zone>,
+    /// The full certificate chain in `.spacecert` format.
+    pub certs: Vec<u8>,
+}
+
+/// Parent-space zones for a resolved `leaf`, ordered `[parent, grandparent, …]`.
+/// Parents are the single-label (space-root) zones in the resolution set, which
+/// come back root→leaf — so reverse to put the immediate parent first.
+fn parent_zones(zones: &[Zone], leaf: &Zone) -> Vec<Zone> {
+    zones
+        .iter()
+        .filter(|z| z.canonical.is_single_label() && z.canonical != leaf.canonical)
+        .rev()
+        .cloned()
+        .collect()
 }
 
 pub struct Fabric {
@@ -645,6 +671,40 @@ impl Fabric {
     }
 
     /// Like [`resolve_all`](Self::resolve_all) but with per-call options.
+    /// One-pass recursive-name lookup → verified zones (plus the cert chain when
+    /// `want_certs`). `hints=false` preserves receipts so the certs stay exportable.
+    async fn resolve_lookup(
+        &self,
+        snames: Vec<SName>,
+        hints: bool,
+        no_cache: bool,
+        want_certs: bool,
+    ) -> Result<(Vec<Zone>, Vec<Certificate>)> {
+        let lookup = libveritas::names::Lookup::new(snames);
+        let mut zones: Vec<Zone> = Vec::new();
+        let mut certs: Vec<Certificate> = Vec::new();
+
+        let mut prev_batch: Vec<SName> = Vec::new();
+        let mut batch: Vec<SName> = lookup.start();
+        while !batch.is_empty() {
+            if batch == prev_batch {
+                break;
+            }
+            let strs: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
+            let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
+            let (verified, _relay_url) = self.resolve_flat(&refs, hints, no_cache).await?;
+            if want_certs {
+                certs.extend(verified.certificates());
+            }
+            prev_batch = batch;
+            batch = lookup.advance(&verified.zones);
+            zones.extend(verified.zones);
+        }
+
+        lookup.expand_zones(&mut zones);
+        Ok((zones, certs))
+    }
+
     pub async fn resolve_all_with_opts(
         &self,
         handles: &[&str],
@@ -654,26 +714,10 @@ impl Fabric {
             .iter()
             .filter_map(|h| SName::try_from(*h).ok())
             .collect();
-
-        let lookup = libveritas::names::Lookup::new(snames);
-        let mut all_zones: Vec<Zone> = Vec::new();
-
-        let mut prev_batch: Vec<SName> = Vec::new();
-        let mut batch: Vec<SName> = lookup.start();
-        while !batch.is_empty() {
-            if batch == prev_batch {
-                break;
-            }
-            let strs: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
-            let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-            let (verified, _relay_url) = self.resolve_flat(&refs, true, opts.no_cache).await?;
-            prev_batch = batch;
-            batch = lookup.advance(&verified.zones);
-            all_zones.extend(verified.zones);
-        }
-
-        lookup.expand_zones(&mut all_zones);
-        Ok(all_zones)
+        let (zones, _) = self
+            .resolve_lookup(snames, true, opts.no_cache, false)
+            .await?;
+        Ok(zones)
     }
 
     /// Export a certificate chain for a handle in `.spacecert` format.
@@ -681,30 +725,33 @@ impl Fabric {
         let sname = SName::try_from(handle)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
 
-        let lookup = libveritas::names::Lookup::new(vec![sname.clone()]);
-        let mut all_verified: Vec<VerifiedMessage> = Vec::new();
+        let (_, certs) = self
+            .resolve_lookup(vec![sname.clone()], false, false, true)
+            .await?;
+        Ok(CertificateChain::new(sname, certs).to_bytes())
+    }
 
-        let mut prev_batch: Vec<SName> = Vec::new();
-        let mut batch: Vec<SName> = lookup.start();
-        while !batch.is_empty() {
-            if batch == prev_batch {
-                break;
-            }
-            let strs: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
-            let refs: Vec<&str> = strs.iter().map(|s| s.as_str()).collect();
-            let (verified, _relay_url) = self.resolve_flat(&refs, false, false).await?;
-            prev_batch = batch;
-            batch = lookup.advance(&verified.zones);
-            all_verified.push(verified);
-        }
+    /// Resolve a handle and export its certificate chain in one pass, also
+    /// surfacing each parent space's zone (commitment/finality) for provenance.
+    /// Returns `None` if the handle doesn't resolve.
+    pub async fn resolve_with_certs(&self, handle: &str) -> Result<Option<ResolvedWithCerts>> {
+        let sname = SName::try_from(handle)
+            .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string()))?;
+        // hints=false so the exported certs carry their receipts.
+        let (zones, certs) = self
+            .resolve_lookup(vec![sname.clone()], false, false, true)
+            .await?;
 
-        let mut certs = Vec::new();
-        for msg in &all_verified {
-            certs.extend(msg.certificates());
-        }
-
-        let chain = CertificateChain::new(sname, certs);
-        Ok(chain.to_bytes())
+        let Some(leaf) = zones.iter().find(|z| z.handle.to_string() == handle).cloned() else {
+            return Ok(None);
+        };
+        let parents = parent_zones(&zones, &leaf);
+        let certs = CertificateChain::new(sname, certs).to_bytes();
+        Ok(Some(ResolvedWithCerts {
+            zone: leaf,
+            parents,
+            certs,
+        }))
     }
 
     /// Resolve a flat list of non-dotted handles in a single relay query.
@@ -1380,4 +1427,39 @@ async fn fetch_anchor_set(
     }
 
     Err(last_err.unwrap_or(Error::NoPeers))
+}
+
+#[cfg(test)]
+mod parent_zone_tests {
+    use super::*;
+
+    // Real zones captured from resolving `across-remove-super.genesis@key` on
+    // mainnet: leaf `across-remove-super#944203-189-0`, its immediate parent
+    // (alice's numeric space) `#944203-189-0`, and the top-level space `@key`.
+    const LEAF: &str = include_str!("testdata/zone_leaf.json");
+    const PARENT: &str = include_str!("testdata/zone_parent.json");
+    const GRANDPARENT: &str = include_str!("testdata/zone_grandparent.json");
+
+    #[test]
+    fn parents_are_immediate_first_across_nesting() {
+        let leaf: Zone = serde_json::from_str(LEAF).unwrap();
+        let parent: Zone = serde_json::from_str(PARENT).unwrap();
+        let grandparent: Zone = serde_json::from_str(GRANDPARENT).unwrap();
+
+        // Resolution yields the zones root -> leaf.
+        let zones = vec![grandparent, parent, leaf.clone()];
+        let canon: Vec<String> = parent_zones(&zones, &leaf)
+            .iter()
+            .map(|z| z.canonical.to_string())
+            .collect();
+
+        // Immediate parent first, top-level space last — not grandparent-first.
+        assert_eq!(canon, ["#944203-189-0", "@key"]);
+    }
+
+    #[test]
+    fn a_space_root_has_no_parents() {
+        let space: Zone = serde_json::from_str(GRANDPARENT).unwrap();
+        assert!(parent_zones(std::slice::from_ref(&space), &space).is_empty());
+    }
 }

@@ -2,6 +2,7 @@ export { Fabric, FabricError, parseScanUri } from "./fabric.js";
 export type {
   FabricOptions,
   ResolveOptions,
+  ResolvedWithCerts,
   PeerInfo,
   VerificationBadge,
   ScanParams,
