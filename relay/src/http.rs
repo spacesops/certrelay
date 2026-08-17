@@ -835,12 +835,12 @@ async fn handle_anchors(
             if let Ok(v) = identity.public_key_hex().parse() {
                 headers.insert("x-anchor-pubkey", v);
             }
-            if let Some(sig) = state.anchor_sig.lock().unwrap().as_ref() {
-                if sig.trust_id == trust_set.id && sig.height == height {
-                    if let Ok(v) = hex::encode(sig.sig).parse() {
-                        headers.insert("x-anchor-sig", v);
-                    }
-                }
+            if let Some(sig) = state.anchor_sig.lock().unwrap().as_ref()
+                && sig.trust_id == trust_set.id
+                && sig.height == height
+                && let Ok(v) = hex::encode(sig.sig).parse()
+            {
+                headers.insert("x-anchor-sig", v);
             }
         }
     }

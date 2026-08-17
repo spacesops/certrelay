@@ -156,7 +156,8 @@ impl Relay {
         // Load (or generate on first boot) the signing identity. Best-effort:
         // a relay that cannot persist a key still serves, just without
         // `X-Anchor-Sig`, matching the `identity: None` path.
-        match crate::identity::RelayIdentity::load_or_create(&config.data_dir.join("identity_key")) {
+        match crate::identity::RelayIdentity::load_or_create(&config.data_dir.join("identity_key"))
+        {
             Ok(id) => {
                 tracing::info!("relay identity pubkey {}", id.public_key_hex());
                 state.identity = Some(id);
