@@ -1637,28 +1637,20 @@ async fn fetch_anchor_set(
 /// `identity::ANCHOR_SIG_TAG`.
 const ANCHOR_SIG_TAG: &[u8] = b"certrelay-anchor-sig-v1";
 
-/// The 32-byte digest a relay signs for an `(anchor root, height)` pair.
-fn anchor_sig_digest(trust_id: &[u8; 32], height: u32) -> [u8; 32] {
-    use sha2::{Digest, Sha256};
-    let mut hasher = Sha256::new();
-    hasher.update(ANCHOR_SIG_TAG);
-    hasher.update(trust_id);
-    hasher.update(height.to_be_bytes());
-    hasher.finalize().into()
+/// The domain-tagged payload a relay signs for an `(anchor root, height)`. It is
+/// verified with `verify_spaces_message`, which applies the Spaces prefix +
+/// SHA256 — the same primitive every language binding ships.
+fn anchor_sig_payload(trust_id: &[u8; 32], height: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(ANCHOR_SIG_TAG.len() + 36);
+    payload.extend_from_slice(ANCHOR_SIG_TAG);
+    payload.extend_from_slice(trust_id);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload
 }
 
 /// Verify a relay's `X-Anchor-Sig` over `(root, height)` against a pinned key.
 fn verify_anchor_sig(root: &[u8; 32], height: u32, sig: &[u8; 64], pubkey: &[u8; 32]) -> bool {
-    let (Ok(sig), Ok(pk)) = (
-        secp256k1::schnorr::Signature::from_slice(sig),
-        secp256k1::XOnlyPublicKey::from_slice(pubkey),
-    ) else {
-        return false;
-    };
-    let msg = secp256k1::Message::from_digest(anchor_sig_digest(root, height));
-    secp256k1::Secp256k1::verification_only()
-        .verify_schnorr(&sig, &msg, &pk)
-        .is_ok()
+    libveritas::verify_spaces_message(&anchor_sig_payload(root, height), sig, pubkey).is_ok()
 }
 
 /// Decode a 32-byte x-only public key from hex, rejecting anything that is not
@@ -1750,7 +1742,7 @@ mod semi_trust_tests {
     /// Sign an (root, height) the way the relay's `identity::sign_anchor` does.
     fn sign(kp: &secp256k1::Keypair, root: &[u8; 32], height: u32) -> [u8; 64] {
         let secp = secp256k1::Secp256k1::new();
-        let msg = secp256k1::Message::from_digest(anchor_sig_digest(root, height));
+        let msg = libveritas::hash_signable_message(&anchor_sig_payload(root, height));
         secp.sign_schnorr_no_aux_rand(&msg, kp).serialize()
     }
 
