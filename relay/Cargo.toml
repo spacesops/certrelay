@@ -29,6 +29,7 @@ rusqlite = { version = "0.31", features = ["bundled"] }
 tokio = { version = "1.37", features = ["sync", "rt-multi-thread", "macros"] }
 rand = "0.9"
 sha2 = "0.10"
+secp256k1 = "0.29"
 tracing = "0.1"
 yuki = { version = "0.0.1", package = "bitcoin_yuki" }
 env_logger = "0.11.9"

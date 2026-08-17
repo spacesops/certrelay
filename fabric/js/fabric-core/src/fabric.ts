@@ -17,6 +17,12 @@ export interface FabricOptions {
   seeds?: string[];
   devMode?: boolean;
   preferLatest?: boolean;
+  /**
+   * Semi-trusted relay pool + quorum, used by {@link Fabric.refreshSemiTrusted}.
+   * Defaults to an empty pool with `"majority"` quorum — populate it with
+   * pinned `(url, pubkey)` relays to enable end-to-end anchor verification.
+   */
+  semiTrusted?: SemiTrustConfig;
 }
 
 /** Per-call resolve options. */
@@ -40,6 +46,76 @@ export interface ResolvedWithCerts {
   parents: FabricZone[];
   /** The full certificate chain in `.spacecert` format. */
   certs: Uint8Array;
+}
+
+/**
+ * A relay in the semi-trusted pool, pinned by URL and x-only public key. The
+ * key is mandatory: a semi-trusted relay is exactly a `(url, pinned key)` pair.
+ * Pin the key out-of-band; never adopt the key a relay advertises in its header.
+ */
+export interface SemiTrustedRelay {
+  url: string;
+  /** Pinned x-only public key as 64-char hex. */
+  pubkey: string;
+}
+
+/**
+ * How much of the semi-trusted pool must agree on a root before it is pinned:
+ * `"all"`, `"majority"`, or `{ atLeast: N }`.
+ */
+export type Quorum = "all" | "majority" | { atLeast: number };
+
+/** The semi-trusted pool plus its quorum policy. */
+export interface SemiTrustConfig {
+  relays: SemiTrustedRelay[];
+  quorum: Quorum;
+}
+
+/**
+ * Outcome of {@link Fabric.refreshSemiTrusted} — enough to render "3/4 relays
+ * agreed" and to know whether the pinned anchor changed.
+ */
+export interface SemiTrustResult {
+  /** Trust id in effect after the refresh: the newly pinned root when quorum
+   * was met, otherwise the previously pinned one (kept as-is), or null. */
+  trustId: string | null;
+  /** Tip height of the agreed anchor set (only set when quorum was met). */
+  height: number | null;
+  /** Relays in the pool (the denominator for "agreed / total"). */
+  total: number;
+  /** Relays whose signature verified this round. */
+  verified: number;
+  /** Verified relays that agreed on the winning root. */
+  agreed: number;
+  /** Agreeing relays required for quorum. */
+  required: number;
+  /** Whether quorum was met — i.e. the semi-trusted anchor was (re)pinned. */
+  quorumMet: boolean;
+}
+
+/** Agreeing relays required for quorum, given the pool size. */
+function quorumRequired(quorum: Quorum, total: number): number {
+  if (quorum === "all") return total;
+  if (quorum === "majority") return Math.floor(total / 2) + 1;
+  return quorum.atLeast;
+}
+
+const ANCHOR_SIG_TAG = new TextEncoder().encode("certrelay-anchor-sig-v1");
+
+/** The domain-tagged payload a relay signs for an `(anchor root, height)`,
+ * verified with `verifySpacesMessage`. Must match the relay's
+ * `identity::anchor_sig_payload`. */
+function anchorSigPayload(rootHex: string, height: number): Uint8Array {
+  const root = hexToBytes(rootHex);
+  const payload = new Uint8Array(ANCHOR_SIG_TAG.length + root.length + 4);
+  payload.set(ANCHOR_SIG_TAG, 0);
+  payload.set(root, ANCHOR_SIG_TAG.length);
+  new DataView(payload.buffer).setUint32(
+    ANCHOR_SIG_TAG.length + root.length,
+    height,
+    false, // big-endian, matching height.to_be_bytes()
+  );
+  return payload;
 }
 
 export interface PeerInfo {
@@ -145,12 +221,14 @@ export class Fabric {
     observed: any[] | null;
   } = { trusted: null, semiTrusted: null, observed: null };
   preferLatest: boolean;
+  private semiTrustConfig: SemiTrustConfig;
 
   constructor(options: FabricOptions) {
     this.provider = options.provider;
     this.seeds = options.seeds ?? [...DEFAULT_SEEDS];
     this.devMode = options.devMode ?? false;
     this.preferLatest = options.preferLatest ?? true;
+    this.semiTrustConfig = options.semiTrusted ?? { relays: [], quorum: "majority" };
   }
 
   private rebuildVeritas(): void {
@@ -275,6 +353,134 @@ export class Fabric {
   /** Returns the hex-encoded semi-trusted trust ID, or null. */
   semiTrusted(): string | null {
     return this._semiTrusted ? toHex(this._semiTrusted.id) : null;
+  }
+
+  /**
+   * The configured semi-trusted pool + quorum. A settings UI can read this to
+   * display the set, then push edits back with {@link setSemiTrustedPool}.
+   */
+  semiTrustedPool(): SemiTrustConfig {
+    // Return a copy so callers can't mutate internal state in place.
+    return {
+      relays: this.semiTrustConfig.relays.map((r) => ({ ...r })),
+      quorum:
+        typeof this.semiTrustConfig.quorum === "object"
+          ? { ...this.semiTrustConfig.quorum }
+          : this.semiTrustConfig.quorum,
+    };
+  }
+
+  /**
+   * Replace the semi-trusted pool + quorum at runtime. Does not itself fetch;
+   * call {@link refreshSemiTrusted} to apply the new pool.
+   */
+  setSemiTrustedPool(relays: SemiTrustedRelay[], quorum: Quorum): void {
+    this.semiTrustConfig = { relays, quorum };
+  }
+
+  /**
+   * Fetch each relay's signed anchor head, verify the `X-Anchor-Sig` against
+   * its pinned key, and pin the root that meets quorum as the semi-trusted
+   * anchor.
+   *
+   * If quorum is not met (relays down, disagreeing, or pool empty), the
+   * existing semi-trusted anchor is kept untouched — a transient never clears a
+   * good anchor. The returned {@link SemiTrustResult} reports the vote
+   * breakdown.
+   */
+  async refreshSemiTrusted(): Promise<SemiTrustResult> {
+    const config = this.semiTrustConfig;
+    const total = config.relays.length;
+
+    // Collect a signed vote per relay; a relay that is down or serves a
+    // bad/absent signature simply does not vote.
+    const votes = new Map<string, { height: number; urls: string[] }>();
+    let verified = 0;
+    for (const relay of config.relays) {
+      const head = await this.fetchSignedAnchorHead(relay);
+      if (!head) continue;
+      verified++;
+      const existing = votes.get(head.root);
+      if (existing) existing.urls.push(relay.url);
+      else votes.set(head.root, { height: head.height, urls: [relay.url] });
+    }
+
+    // Winner: the root the most relays agree on, breaking ties by height.
+    let winner: { root: string; height: number; urls: string[] } | null = null;
+    for (const [root, { height, urls }] of votes) {
+      if (
+        !winner ||
+        urls.length > winner.urls.length ||
+        (urls.length === winner.urls.length && height > winner.height)
+      ) {
+        winner = { root, height, urls };
+      }
+    }
+
+    const required = quorumRequired(config.quorum, total);
+    const agreed = winner ? winner.urls.length : 0;
+    const quorumMet = agreed > 0 && agreed >= required;
+
+    if (quorumMet && winner) {
+      // Fetch the full set from a relay that voted for this root (it
+      // demonstrably serves it) and pin it as the semi-trusted anchor.
+      const result = await this.fetchAnchors(winner.root, winner.urls);
+      const trustSet = result.handle.computeTrustSet();
+      if (toHex(trustSet.id) !== winner.root) {
+        throw new FabricError("anchor root mismatch", "decode");
+      }
+      this.anchorEntries.semiTrusted = result.entries;
+      this.rebuildVeritas();
+      this._semiTrusted = trustSet;
+      return {
+        trustId: winner.root,
+        height: winner.height,
+        total,
+        verified,
+        agreed,
+        required,
+        quorumMet: true,
+      };
+    }
+
+    // Keep whatever anchor we already had.
+    return {
+      trustId: this.semiTrusted(),
+      height: null,
+      total,
+      verified,
+      agreed,
+      required,
+      quorumMet: false,
+    };
+  }
+
+  /**
+   * HEAD a relay's `/anchors`, read the signed `(root, height)`, and verify the
+   * `X-Anchor-Sig` against the pinned key. Returns null if the relay is down,
+   * omits the signature, or the signature does not verify.
+   */
+  private async fetchSignedAnchorHead(
+    relay: SemiTrustedRelay,
+  ): Promise<{ root: string; height: number } | null> {
+    try {
+      const resp = await fetch(`${relay.url}/anchors`, { method: "HEAD" });
+      if (!resp.ok) return null;
+      const root = resp.headers.get("x-anchor-root");
+      const sigHex = resp.headers.get("x-anchor-sig");
+      if (!root || !sigHex) return null;
+      const height = parseInt(resp.headers.get("x-anchor-height") ?? "0", 10);
+
+      const sig = hexToBytes(sigHex);
+      const pubkey = hexToBytes(relay.pubkey);
+      if (sig.length !== 64 || pubkey.length !== 32) return null;
+
+      const payload = anchorSigPayload(root, height);
+      if (!this.provider.verifySpacesMessage(payload, sig, pubkey)) return null;
+      return { root, height };
+    } catch {
+      return null;
+    }
   }
 
   /** Clear the trusted anchor set. */

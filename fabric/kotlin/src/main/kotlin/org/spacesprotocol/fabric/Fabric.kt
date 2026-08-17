@@ -85,6 +85,20 @@ private class AnchorPool {
 
 data class ScanParams(val id: String)
 
+/**
+ * A resolved handle plus its exportable cert chain and parent-space context.
+ *
+ * @property zone the resolved leaf zone
+ * @property parents parent-space zones ordered [parent, grandparent, ...,
+ *   top-level space]; each carries its own commitment/sovereignty
+ * @property certs the full certificate chain in .spacecert format
+ */
+data class ResolvedWithCerts(
+    val zone: Zone,
+    val parents: List<Zone>,
+    val certs: ByteArray,
+)
+
 class Fabric(
     private val seeds: List<String> = DEFAULT_SEEDS,
     var devMode: Boolean = false,
@@ -336,6 +350,42 @@ class Fabric(
         }
 
         return createCertificateChain(handle, allCertBytes)
+    }
+
+    /**
+     * Resolve a handle and export its certificate chain in one pass, also
+     * surfacing each parent space's zone (commitment/finality). Returns null if
+     * the handle doesn't resolve.
+     */
+    fun resolveWithCerts(handle: String, noCache: Boolean = false): ResolvedWithCerts? {
+        val lookup = Lookup(listOf(handle))
+        val allZones = mutableListOf<Zone>()
+        val allCertBytes = mutableListOf<ByteArray>()
+
+        var prevBatch = emptyList<String>()
+        var batch = lookup.start()
+        while (batch.isNotEmpty()) {
+            if (batch == prevBatch) break
+            // hints=false so the exported certs carry their receipts.
+            val verified = resolveFlat(batch, false, noCache)
+            allCertBytes.addAll(verified.certificates())
+            val zones = verified.zones()
+            prevBatch = batch
+            batch = lookup.advance(zones)
+            allZones.addAll(zones)
+        }
+
+        val expanded = lookup.expandZones(allZones)
+        val leaf = expanded.find { it.handle == handle } ?: return null
+
+        // Parent spaces (single-label handle @/#) other than the leaf, reversed
+        // for parent-first ordering.
+        val parents = expanded
+            .filter { (it.handle.startsWith("@") || it.handle.startsWith("#")) && it.handle != leaf.handle }
+            .reversed()
+
+        val certs = createCertificateChain(handle, allCertBytes)
+        return ResolvedWithCerts(zone = leaf, parents = parents, certs = certs)
     }
 
     private fun resolveFlat(handles: List<String>, hints: Boolean, noCache: Boolean): VerifiedMessage {

@@ -93,6 +93,30 @@ async function exampleResolveAll() {
     // </doc:resolve-all>
 }
 
+/// Resolve a handle and export its certificate chain in one pass
+async function exampleResolveWithCerts() {
+    const fabric = new Fabric();
+
+    // <doc:resolve-with-certs>
+    const resolved = await fabric.resolveWithCerts("alice@bitcoin");
+    if (!resolved) {
+        console.log("handle not found");
+        return;
+    }
+
+    console.log(`handle: ${resolved.zone.handle}`);
+
+    // Parent spaces, immediate parent first. Each zone carries its own
+    // commitment/finality (see zone.toJson().commitment) for provenance.
+    for (const parent of resolved.parents) {
+        console.log(`  parent ${parent.handle}: ${parent.toJson().sovereignty}`);
+    }
+
+    // resolved.certs is the full .spacecert chain, ready to persist or verify.
+    console.log(`cert chain: ${resolved.certs.length} bytes`);
+    // </doc:resolve-with-certs>
+}
+
 /// Pack records into a RecordSet
 function examplePackRecords() {
     // <doc:pack-records>
@@ -202,6 +226,7 @@ async function main() {
 
     await exampleUnpackRecords();
     await exampleResolveAll();
+    await exampleResolveWithCerts();
     examplePackRecords();
     await examplePublish();
     await exampleResolveById();

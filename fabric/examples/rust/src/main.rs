@@ -112,6 +112,31 @@ async fn example_resolve_all() -> anyhow::Result<()> {
     Ok(())
 }
 
+/// Resolve a handle and export its certificate chain in one pass
+async fn example_resolve_with_certs() -> anyhow::Result<()> {
+    let fabric = Fabric::new();
+
+    // <doc:resolve-with-certs>
+    let Some(resolved) = fabric.resolve_with_certs("alice@bitcoin").await? else {
+        println!("handle not found");
+        return Ok(());
+    };
+
+    println!("handle: {}", resolved.zone.handle);
+
+    // Parent spaces, immediate parent first. Each zone carries its own
+    // commitment/finality (see `zone.commitment`) for provenance.
+    for parent in &resolved.parents {
+        println!("  parent {}: {:?}", parent.handle, parent.sovereignty);
+    }
+
+    // `resolved.certs` is the full .spacecert chain, ready to persist or verify.
+    println!("cert chain: {} bytes", resolved.certs.len());
+    // </doc:resolve-with-certs>
+
+    Ok(())
+}
+
 /// Pack records into a RecordSet
 fn example_pack_records() -> anyhow::Result<()> {
     // <doc:pack-records>
@@ -230,6 +255,7 @@ async fn main() -> anyhow::Result<()> {
     let _ = example_trust_and_verification().await;
     example_unpack_records().await?;
     example_resolve_all().await?;
+    let _ = example_resolve_with_certs().await;
     example_pack_records()?;
     example_publish().await?;
     example_resolve_by_id().await?;

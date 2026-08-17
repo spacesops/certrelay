@@ -23,7 +23,7 @@ required-features = ["client"]
 
 [features]
 default = ["client"]
-client = ["reqwest", "rand", "tokio"]
+client = ["reqwest", "rand", "tokio", "secp256k1"]
 signing = ["secp256k1"]
 
 [dependencies]

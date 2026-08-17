@@ -128,6 +128,19 @@ class ScanParams:
         return ScanParams(id=trust_id)
 
 
+@dataclass
+class ResolvedWithCerts:
+    """A resolved handle plus its exportable cert chain and parent-space context."""
+
+    #: The resolved leaf zone.
+    zone: "lv.Zone"
+    #: Parent-space zones ordered [parent, grandparent, ..., top-level space].
+    #: Each carries its own commitment/sovereignty.
+    parents: "list[lv.Zone]"
+    #: The full certificate chain in .spacecert format.
+    certs: bytes
+
+
 class Fabric:
     def __init__(
         self,
@@ -347,6 +360,47 @@ class Fabric:
             batch = lookup.advance(zones)
 
         return lv.create_certificate_chain(handle, all_cert_bytes)
+
+    def resolve_with_certs(
+        self, handle: str, *, no_cache: bool = False
+    ) -> "ResolvedWithCerts | None":
+        """Resolve a handle and export its cert chain in one pass, also surfacing
+        each parent space's zone (commitment/finality). Returns None if not found.
+        """
+        lookup = lv.Lookup([handle])
+        all_zones: list[lv.Zone] = []
+        all_cert_bytes: list[bytes] = []
+
+        prev_batch: list[str] = []
+        batch = lookup.start()
+        while batch:
+            if batch == prev_batch:
+                break
+            # hints=False so the exported certs carry their receipts.
+            verified = self._resolve_flat(batch, hints=False, no_cache=no_cache)
+            all_cert_bytes.extend(verified.certificates())
+            zones = verified.zones()
+            prev_batch = batch
+            batch = lookup.advance(zones)
+            all_zones.extend(zones)
+
+        expanded = lookup.expand_zones(all_zones)
+        leaf = next((z for z in expanded if z.handle == handle), None)
+        if leaf is None:
+            return None
+
+        # Parent spaces (single-label handle @/#) other than the leaf, reversed
+        # for parent-first ordering.
+        parents = [
+            z
+            for z in expanded
+            if (z.handle.startswith("@") or z.handle.startswith("#"))
+            and z.handle != leaf.handle
+        ]
+        parents.reverse()
+
+        certs = lv.create_certificate_chain(handle, all_cert_bytes)
+        return ResolvedWithCerts(zone=leaf, parents=parents, certs=certs)
 
     def bootstrap(self):
         if self._pool.is_empty():

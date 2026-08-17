@@ -94,6 +94,28 @@ async def example_resolve_all():
     # </doc:resolve-all>
 
 
+async def example_resolve_with_certs():
+    """Resolve a handle and export its certificate chain in one pass"""
+    fabric = Fabric()
+
+    # <doc:resolve-with-certs>
+    resolved = await fabric.resolve_with_certs("alice@bitcoin")
+    if resolved is None:
+        print("handle not found")
+        return
+
+    print(f"handle: {resolved.zone.handle}")
+
+    # Parent spaces, immediate parent first. Each zone carries its own
+    # commitment/finality (see zone.commitment) for provenance.
+    for parent in resolved.parents:
+        print(f"  parent {parent.handle}: {parent.sovereignty}")
+
+    # resolved.certs is the full .spacecert chain, ready to persist or verify.
+    print(f"cert chain: {len(resolved.certs)} bytes")
+    # </doc:resolve-with-certs>
+
+
 def example_pack_records():
     """Pack records into a RecordSet"""
     # <doc:pack-records>
@@ -196,6 +218,7 @@ async def main():
 
     await example_unpack_records()
     await example_resolve_all()
+    await example_resolve_with_certs()
     example_pack_records()
     await example_publish()
     await example_resolve_by_id()

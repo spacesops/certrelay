@@ -96,6 +96,29 @@ func exampleResolveAll() async throws {
     // </doc:resolve-all>
 }
 
+/// Resolve a handle and export its certificate chain in one pass
+func exampleResolveWithCerts() async throws {
+    let fabric = Fabric()
+
+    // <doc:resolve-with-certs>
+    guard let resolved = try await fabric.resolveWithCerts("alice@bitcoin") else {
+        print("handle not found")
+        return
+    }
+
+    print("handle: \(resolved.zone.handle)")
+
+    // Parent spaces, immediate parent first. Each zone carries its own
+    // commitment/finality (see zone.commitment) for provenance.
+    for parent in resolved.parents {
+        print("  parent \(parent.handle): \(parent.sovereignty)")
+    }
+
+    // resolved.certs is the full .spacecert chain, ready to persist or verify.
+    print("cert chain: \(resolved.certs.count) bytes")
+    // </doc:resolve-with-certs>
+}
+
 /// Pack records into a RecordSet
 func examplePackRecords() throws {
     // <doc:pack-records>
@@ -210,6 +233,7 @@ struct Example {
         do {
             try await exampleUnpackRecords()
             try await exampleResolveAll()
+            try await exampleResolveWithCerts()
             try examplePackRecords()
             try await examplePublish()
             try await exampleResolveById()

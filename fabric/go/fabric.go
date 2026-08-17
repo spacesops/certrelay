@@ -660,6 +660,91 @@ func (f *Fabric) Export(handle string) ([]byte, error) {
 	return libveritas.CreateCertificateChain(handle, allCertBytes)
 }
 
+// ResolvedWithCerts is a resolved handle plus its exportable cert chain and
+// parent-space context.
+type ResolvedWithCerts struct {
+	// Zone is the resolved leaf zone.
+	Zone libveritas.Zone
+	// Parents are the parent-space zones ordered [parent, grandparent, ...,
+	// top-level space]. Each carries its own commitment/sovereignty.
+	Parents []libveritas.Zone
+	// Certs is the full certificate chain in .spacecert format.
+	Certs []byte
+}
+
+// ResolveWithCerts resolves a handle and exports its certificate chain in one
+// pass, also surfacing each parent space's zone (commitment/finality) for
+// provenance. Returns nil if the handle doesn't resolve.
+func (f *Fabric) ResolveWithCerts(handle string) (*ResolvedWithCerts, error) {
+	return f.ResolveWithCertsOptions(handle, ResolveOptions{})
+}
+
+// ResolveWithCertsOptions is like ResolveWithCerts but accepts per-call options.
+func (f *Fabric) ResolveWithCertsOptions(handle string, opts ResolveOptions) (*ResolvedWithCerts, error) {
+	lookup, err := libveritas.NewLookup([]string{handle})
+	if err != nil {
+		return nil, err
+	}
+	defer lookup.Destroy()
+
+	var allZones []libveritas.Zone
+	var allCertBytes [][]byte
+	var prevBatch []string
+	batch := lookup.Start()
+	for len(batch) > 0 {
+		if slicesEqual(batch, prevBatch) {
+			break
+		}
+		// hints=false so the exported certs carry their receipts.
+		verified, err := f.resolveFlat(batch, false, opts)
+		if err != nil {
+			return nil, err
+		}
+		allCertBytes = append(allCertBytes, verified.Certificates()...)
+		zones := verified.Zones()
+		prevBatch = batch
+		next, err := lookup.Advance(zones)
+		if err != nil {
+			return nil, err
+		}
+		allZones = append(allZones, zones...)
+		batch = next
+	}
+
+	expanded, err := lookup.ExpandZones(allZones)
+	if err != nil {
+		return nil, err
+	}
+
+	var leaf *libveritas.Zone
+	for i := range expanded {
+		if expanded[i].Handle == handle {
+			leaf = &expanded[i]
+			break
+		}
+	}
+	if leaf == nil {
+		return nil, nil
+	}
+
+	// Parent spaces (canonical starts with @ or #) other than the leaf,
+	// iterated root->leaf in reverse for parent-first ordering.
+	var parents []libveritas.Zone
+	for i := len(expanded) - 1; i >= 0; i-- {
+		c := expanded[i].Canonical
+		if (strings.HasPrefix(c, "@") || strings.HasPrefix(c, "#")) && c != leaf.Canonical {
+			parents = append(parents, expanded[i])
+		}
+	}
+
+	certs, err := libveritas.CreateCertificateChain(handle, allCertBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	return &ResolvedWithCerts{Zone: *leaf, Parents: parents, Certs: certs}, nil
+}
+
 // Sign builds and signs a message. Returns message bytes.
 // cert: .spacecert bytes from Export()
 // records: unsigned RecordSet bytes
