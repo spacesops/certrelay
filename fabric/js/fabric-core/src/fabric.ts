@@ -1,6 +1,6 @@
 import { RelayPool } from "./pool.js";
 import { compareHints, HintsResponse } from "./hints.js";
-import { DEFAULT_SEEDS } from "./seeds.js";
+import { DEFAULT_SEEDS, DEFAULT_SEMI_TRUSTED } from "./seeds.js";
 import type {
   VeritasProvider,
   VeritasHandle,
@@ -228,7 +228,10 @@ export class Fabric {
     this.seeds = options.seeds ?? [...DEFAULT_SEEDS];
     this.devMode = options.devMode ?? false;
     this.preferLatest = options.preferLatest ?? true;
-    this.semiTrustConfig = options.semiTrusted ?? { relays: [], quorum: "majority" };
+    this.semiTrustConfig = options.semiTrusted ?? {
+      relays: DEFAULT_SEMI_TRUSTED.map((r) => ({ ...r })),
+      quorum: "majority",
+    };
   }
 
   private rebuildVeritas(): void {
