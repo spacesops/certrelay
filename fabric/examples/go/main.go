@@ -136,6 +136,35 @@ func exampleResolveAll() error {
 	return nil
 }
 
+/// Resolve a handle and export its certificate chain in one pass
+func exampleResolveWithCerts() error {
+	f := fabric.New()
+
+	// <doc:resolve-with-certs>
+	resolved, err := f.ResolveWithCerts("alice@bitcoin")
+	if err != nil {
+		return err
+	}
+	if resolved == nil {
+		fmt.Println("handle not found")
+		return nil
+	}
+
+	fmt.Printf("handle: %s\n", resolved.Zone.Handle)
+
+	// Parent spaces, immediate parent first. Each zone carries its own
+	// commitment/finality (see zone.Commitment) for provenance.
+	for _, parent := range resolved.Parents {
+		fmt.Printf("  parent %s: %s\n", parent.Handle, parent.Sovereignty)
+	}
+
+	// resolved.Certs is the full .spacecert chain, ready to persist or verify.
+	fmt.Printf("cert chain: %d bytes\n", len(resolved.Certs))
+	// </doc:resolve-with-certs>
+
+	return nil
+}
+
 /// Pack records into a RecordSet
 func examplePackRecords() error {
 	// <doc:pack-records>
@@ -314,6 +343,10 @@ func main() {
 	}
 
 	if err := exampleResolveAll(); err != nil {
+		log.Fatal(err)
+	}
+
+	if err := exampleResolveWithCerts(); err != nil {
 		log.Fatal(err)
 	}
 

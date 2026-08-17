@@ -109,6 +109,30 @@ suspend fun exampleResolveAll() {
     // </doc:resolve-all>
 }
 
+/// Resolve a handle and export its certificate chain in one pass
+suspend fun exampleResolveWithCerts() {
+    val fabric = Fabric()
+
+    // <doc:resolve-with-certs>
+    val resolved = fabric.resolveWithCerts("alice@bitcoin")
+    if (resolved == null) {
+        println("handle not found")
+        return
+    }
+
+    println("handle: ${resolved.zone.handle}")
+
+    // Parent spaces, immediate parent first. Each zone carries its own
+    // commitment/finality (see zone.commitment) for provenance.
+    for (parent in resolved.parents) {
+        println("  parent ${parent.handle}: ${parent.sovereignty}")
+    }
+
+    // resolved.certs is the full .spacecert chain, ready to persist or verify.
+    println("cert chain: ${resolved.certs.size} bytes")
+    // </doc:resolve-with-certs>
+}
+
 /// Pack records into a RecordSet
 fun examplePackRecords() {
     // <doc:pack-records>
@@ -213,6 +237,7 @@ suspend fun main() {
 
     exampleUnpackRecords()
     exampleResolveAll()
+    exampleResolveWithCerts()
     examplePackRecords()
     examplePublish()
     exampleResolveById()
