@@ -339,7 +339,40 @@ async fn refresh_anchors(state: &AppState) -> anyhow::Result<()> {
     let new_veritas = create_relay_veritas(anchors)?;
     *state.handler.veritas.write().unwrap() = new_veritas;
     *state.handler.anchor_store.lock().unwrap() = anchor_store;
+    refresh_anchor_sig(state);
     Ok(())
+}
+
+/// Re-sign the anchor root we serve, but only when it actually changed. The
+/// Schnorr signature is cached and served verbatim from `/anchors`, so this
+/// keeps per-request cost at a header copy instead of a signing operation.
+fn refresh_anchor_sig(state: &AppState) {
+    let Some(identity) = &state.identity else {
+        return;
+    };
+    // Clone the latest set out before touching the signature cache so we never
+    // hold the anchor-store lock across the sign (and so the two locks are
+    // always taken store-then-sig, avoiding a cycle with the read path).
+    let latest = state.handler.anchor_store.lock().unwrap().latest().cloned();
+    let Some(latest) = latest else {
+        return;
+    };
+    let height = latest.tip_height();
+    let trust_id = libveritas::compute_trust_set(&latest.entries).id;
+
+    let mut cache = state.anchor_sig.lock().unwrap();
+    let unchanged = cache
+        .as_ref()
+        .is_some_and(|c| c.trust_id == trust_id && c.height == height);
+    if unchanged {
+        return;
+    }
+    let sig = identity.sign_anchor(&trust_id, height);
+    *cache = Some(crate::identity::AnchorSig {
+        trust_id,
+        height,
+        sig,
+    });
 }
 
 pub fn build_hash_indexes_for_checkpoint(spaces_dir: PathBuf) -> anyhow::Result<()> {

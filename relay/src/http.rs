@@ -168,6 +168,14 @@ pub struct AppState {
     pub retention: crate::retention::RetentionConfig,
     /// Approximate recently-queried handles, spared during eviction.
     pub query_heat: std::sync::Mutex<crate::retention::QueryHeat>,
+    /// Long-lived signing key used to sign the anchor root we serve. `None`
+    /// when no key has been provisioned (e.g. in tests); then `X-Anchor-Sig`
+    /// is simply omitted.
+    pub identity: Option<crate::identity::RelayIdentity>,
+    /// Cached signature over the current `(anchor root, height)`. Recomputed by
+    /// the anchor refresh only when the pair changes, so steady-state requests
+    /// never re-sign.
+    pub anchor_sig: std::sync::Mutex<Option<crate::identity::AnchorSig>>,
 }
 
 impl AppState {
@@ -204,6 +212,8 @@ impl AppState {
             stats: crate::stats::Stats::default(),
             retention: crate::retention::RetentionConfig::default(),
             query_heat: std::sync::Mutex::new(crate::retention::QueryHeat::default()),
+            identity: None,
+            anchor_sig: std::sync::Mutex::new(None),
         }
     }
 
@@ -276,8 +286,24 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/poke", post(handle_poke))
         .route("/health", get(handle_health))
         .route("/stats", get(handle_stats))
+        .layer(axum::middleware::from_fn(version_header))
         .layer(cors)
         .with_state(state)
+}
+
+/// Stamp `X-Certrelay-Version` on every response. The value is `CARGO_PKG_VERSION`
+/// at compile time — i.e. whatever release-plz bumped the crate to — so it needs
+/// no manual upkeep and lets clients see which build a relay is running.
+async fn version_header(
+    req: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> axum::response::Response {
+    let mut resp = next.run(req).await;
+    resp.headers_mut().insert(
+        "x-certrelay-version",
+        axum::http::HeaderValue::from_static(env!("CARGO_PKG_VERSION")),
+    );
+    resp
 }
 
 /// Extract the client IP from the configured header, falling back to socket address.
@@ -429,6 +455,12 @@ async fn handle_stats(
         "proof_permits_available": state.proof_sem.available_permits(),
         "verify_permits_available": state.verify_sem.available_permits(),
     });
+    // Report the running version (whatever release-plz stamped into the crate)
+    // and the anchor-signing pubkey, so operators/clients can read both here.
+    snapshot["version"] = serde_json::json!(env!("CARGO_PKG_VERSION"));
+    if let Some(identity) = &state.identity {
+        snapshot["anchor_pubkey"] = serde_json::json!(identity.public_key_hex());
+    }
     axum::Json(snapshot).into_response()
 }
 
@@ -792,6 +824,24 @@ async fn handle_anchors(
         }
         if let Ok(v) = height.to_string().parse() {
             headers.insert("x-anchor-height", v);
+        }
+        // End-to-end signature over the root so a client that pins this relay's
+        // key can trust the root even when TLS terminates at a proxy. The
+        // public key is advertised for discovery, but clients MUST pin it
+        // out-of-band rather than trust whatever the header claims. Attach the
+        // signature only when the cache matches the root/height we're reporting
+        // — a refresh in flight can briefly lag, and no sig beats a stale one.
+        if let Some(identity) = &state.identity {
+            if let Ok(v) = identity.public_key_hex().parse() {
+                headers.insert("x-anchor-pubkey", v);
+            }
+            if let Some(sig) = state.anchor_sig.lock().unwrap().as_ref() {
+                if sig.trust_id == trust_set.id && sig.height == height {
+                    if let Ok(v) = hex::encode(sig.sig).parse() {
+                        headers.insert("x-anchor-sig", v);
+                    }
+                }
+            }
         }
     }
 
