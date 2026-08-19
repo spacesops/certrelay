@@ -149,10 +149,33 @@ export class FabricError extends Error {
       | "relay"
       | "no_peers" = "http",
     public status?: number,
+    options?: { cause?: unknown },
   ) {
     super(message);
     this.name = "FabricError";
+    // Preserve the original error so consumers can read the structured detail
+    // (e.g. a libveritas VeritasError's `.inner.msg`). Assigned manually rather
+    // than via `super(message, { cause })` so it works regardless of TS lib
+    // target.
+    if (options && "cause" in options) {
+      (this as { cause?: unknown }).cause = options.cause;
+    }
   }
+}
+
+/**
+ * Human-readable detail from a thrown error. libveritas throws a `VeritasError`
+ * whose enum name is all that survives string interpolation (`${e}` →
+ * "VeritasError.VerificationFailed"); the real reason lives on `.inner.msg`
+ * (e.g. "anchor <x> is stale, oldest is <y>"). Fall back to `String(e)` for
+ * plain errors.
+ */
+function errorDetail(e: unknown): string {
+  if (e && typeof e === "object") {
+    const inner = (e as { inner?: { msg?: unknown } }).inner;
+    if (inner && typeof inner.msg === "string") return inner.msg;
+  }
+  return String(e);
 }
 
 function toHex(bytes: Uint8Array): string {
@@ -741,7 +764,7 @@ export class Fabric {
 
         return zone;
       } catch (e) {
-        lastErr = e instanceof FabricError ? e : new FabricError(`reverse failed: ${e}`, "http");
+        lastErr = e instanceof FabricError ? e : new FabricError(`reverse failed: ${errorDetail(e)}`, "http", undefined, { cause: e });
       }
     }
 
@@ -790,7 +813,7 @@ export class Fabric {
 
         return matching;
       } catch (e) {
-        lastErr = e instanceof FabricError ? e : new FabricError(`addr search failed: ${e}`, "http");
+        lastErr = e instanceof FabricError ? e : new FabricError(`addr search failed: ${errorDetail(e)}`, "http", undefined, { cause: e });
       }
     }
 
@@ -1013,8 +1036,10 @@ export class Fabric {
         } catch (e) {
           this.pool.markFailed(url);
           lastErr = new FabricError(
-            `verification error: ${e}`,
+            `verification error: ${errorDetail(e)}`,
             "verify",
+            undefined,
+            { cause: e },
           );
         }
       } catch (e) {
