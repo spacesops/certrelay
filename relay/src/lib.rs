@@ -3,6 +3,7 @@
 pub mod app;
 pub mod handler;
 pub mod http;
+pub mod identity;
 pub mod peer;
 pub mod relay;
 pub mod retention;

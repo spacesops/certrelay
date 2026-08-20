@@ -55,12 +55,17 @@ export {
   RelayPool,
   compareHints,
   DEFAULT_SEEDS,
+  DEFAULT_SEMI_TRUSTED,
 } from "@spacesprotocol/fabric-core";
 
 export type {
   FabricZone,
   ResolveOptions,
   ResolvedWithCerts,
+  SemiTrustedRelay,
+  Quorum,
+  SemiTrustConfig,
+  SemiTrustResult,
   PeerInfo,
   HintsResponse,
   SpaceHint,

@@ -72,6 +72,12 @@ export interface VeritasProvider {
   createLookup(names: string[]): LookupHandle;
   createCertificateChain(subject: string, certBytesList: Uint8Array[]): Uint8Array;
   createMessageBuilder(): MessageBuilderHandle;
+  /**
+   * Verify a Spaces signed message (`sha256(prefix || msg)` + BIP-340 Schnorr)
+   * against an x-only pubkey. Returns `true` iff the signature is valid. Used
+   * to verify a relay's `X-Anchor-Sig`.
+   */
+  verifySpacesMessage(msg: Uint8Array, signature: Uint8Array, pubkey: Uint8Array): boolean;
 }
 
 // ── Symbol for accessing the underlying native object ──
@@ -97,6 +103,7 @@ export interface WasmLibveritas {
   MessageBuilder: new () => any;
   zoneToBytes(zone: any): Uint8Array;
   createCertificateChain(subject: string, certBytesList: Uint8Array[]): Uint8Array;
+  verifySpacesMessage(msg: Uint8Array, signature: Uint8Array, pubkey: Uint8Array): void;
 }
 
 /**
@@ -179,6 +186,15 @@ export function wasmProvider(lib: WasmLibveritas): VeritasProvider {
     createCertificateChain(subject, certBytesList) {
       return lib.createCertificateChain(subject, certBytesList);
     },
+    verifySpacesMessage(msg, signature, pubkey) {
+      // The binding throws on an invalid signature and returns void on success.
+      try {
+        lib.verifySpacesMessage(msg, signature, pubkey);
+        return true;
+      } catch {
+        return false;
+      }
+    },
     createMessageBuilder() {
       const builder = new lib.MessageBuilder();
       return {
@@ -212,6 +228,7 @@ export interface ReactNativeLibveritas {
   zoneToBytes(zone: any): ArrayBuffer;
   zoneToJson(zone: any): string;
   createCertificateChain(subject: string, certBytesList: ArrayBuffer[]): ArrayBuffer;
+  verifySpacesMessage(msg: ArrayBuffer, signature: ArrayBuffer, pubkey: ArrayBuffer): void;
 }
 
 /**
@@ -325,6 +342,17 @@ export function reactNativeProvider(
         return buf as ArrayBuffer;
       });
       return new Uint8Array(lib.createCertificateChain(subject, buffers));
+    },
+    verifySpacesMessage(msg, signature, pubkey) {
+      const toBuf = (b: Uint8Array) =>
+        b.buffer.slice(b.byteOffset, b.byteOffset + b.byteLength) as ArrayBuffer;
+      // The binding throws on an invalid signature and returns void on success.
+      try {
+        lib.verifySpacesMessage(toBuf(msg), toBuf(signature), toBuf(pubkey));
+        return true;
+      } catch {
+        return false;
+      }
     },
     createMessageBuilder() {
       const builder = new lib.MessageBuilder();

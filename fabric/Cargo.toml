@@ -30,7 +30,7 @@ required-features = ["client", "signing"]
 # don't want secp256k1 link-in (e.g. the `relay` crate) opt out with
 # `default-features = false`.
 default = ["client", "signing"]
-client = ["reqwest", "rand", "tokio"]
+client = ["reqwest", "rand", "tokio", "secp256k1"]
 signing = ["secp256k1"]
 
 [dependencies]

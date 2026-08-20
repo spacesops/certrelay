@@ -1,4 +1,4 @@
-use crate::seeds::SEEDS;
+use crate::seeds::{SEED_SEMI_TRUSTED, SEEDS};
 pub use crate::{
     AnchorSet, EpochHint, HintsResponse, Message, PeerInfo, Query, QueryRequest, TrustId,
 };
@@ -117,6 +117,9 @@ pub struct Fabric {
     anchor_pool: Mutex<AnchorPool>,
     /// Whether to look for the latest zone from multiple peers
     prefer_latest: AtomicBool,
+    /// Pool of pinned semi-trusted relays + quorum policy, used by
+    /// `refresh_semi_trusted`. Configured at construction, swappable at runtime.
+    semi_trust_config: Mutex<SemiTrustConfig>,
 }
 
 /// Keeps raw anchors from each trust source so they can be merged into one Veritas.
@@ -199,6 +202,110 @@ impl fmt::Display for Badge {
     }
 }
 
+/// A relay in the semi-trusted pool, pinned by URL and x-only public key. The
+/// key is mandatory: a semi-trusted relay is exactly a `(url, pinned key)` pair,
+/// and without a key there is nothing to verify.
+#[derive(Clone, Debug)]
+pub struct SemiTrustedRelay {
+    pub url: String,
+    /// Pinned 32-byte x-only public key. Pin this out-of-band; never adopt the
+    /// key a relay advertises in its own header.
+    pub pubkey: [u8; 32],
+}
+
+impl SemiTrustedRelay {
+    pub fn new(url: impl Into<String>, pubkey: [u8; 32]) -> Self {
+        Self {
+            url: url.into(),
+            pubkey,
+        }
+    }
+
+    /// Build from a URL and a hex-encoded x-only public key. The hex is
+    /// validated as a real key so a bad pin fails loudly here, not silently at
+    /// verify time.
+    pub fn from_hex(url: impl Into<String>, pubkey_hex: &str) -> Result<Self> {
+        Ok(Self {
+            url: url.into(),
+            pubkey: parse_xonly_hex(pubkey_hex)?,
+        })
+    }
+
+    /// Hex of the pinned key (for display/persistence).
+    pub fn pubkey_hex(&self) -> String {
+        hex::encode(self.pubkey)
+    }
+}
+
+/// How much of the semi-trusted pool must agree on a root before it is pinned.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Quorum {
+    /// Every relay in the pool must agree (one down relay blocks quorum).
+    All,
+    /// At least N relays must agree.
+    AtLeast(usize),
+    /// A strict majority of the pool must agree.
+    Majority,
+}
+
+impl Quorum {
+    /// Agreeing relays required, given the pool size.
+    fn required(self, total: usize) -> usize {
+        match self {
+            Quorum::All => total,
+            Quorum::AtLeast(n) => n,
+            Quorum::Majority => total / 2 + 1,
+        }
+    }
+}
+
+/// The semi-trusted pool plus its quorum policy. Configured at construction
+/// (defaulting to the built-in bootstrap pool) and swappable at runtime; it
+/// round-trips through [`Fabric::semi_trusted_pool`] /
+/// [`Fabric::set_semi_trusted_pool`].
+#[derive(Clone, Debug)]
+pub struct SemiTrustConfig {
+    pub relays: Vec<SemiTrustedRelay>,
+    pub quorum: Quorum,
+}
+
+impl Default for SemiTrustConfig {
+    fn default() -> Self {
+        let relays = SEED_SEMI_TRUSTED
+            .iter()
+            .map(|(url, key)| {
+                SemiTrustedRelay::from_hex(*url, key)
+                    .expect("built-in SEED_SEMI_TRUSTED keys must be valid")
+            })
+            .collect();
+        Self {
+            relays,
+            quorum: Quorum::Majority,
+        }
+    }
+}
+
+/// Outcome of [`Fabric::refresh_semi_trusted`] — enough to render "3/4 relays
+/// agreed" and to know whether the pinned anchor changed.
+#[derive(Clone, Debug)]
+pub struct SemiTrustResult {
+    /// Trust id in effect after the refresh: the newly pinned root when quorum
+    /// was met, otherwise the previously pinned one (kept as-is), if any.
+    pub trust_id: Option<TrustId>,
+    /// Tip height of the agreed anchor set (only set when quorum was met).
+    pub height: Option<u32>,
+    /// Relays in the pool (the denominator for "agreed / total").
+    pub total: usize,
+    /// Relays whose signature verified this round.
+    pub verified: usize,
+    /// Verified relays that agreed on the winning root.
+    pub agreed: usize,
+    /// Agreeing relays required for quorum.
+    pub required: usize,
+    /// Whether quorum was met — i.e. the semi-trusted anchor was (re)pinned.
+    pub quorum_met: bool,
+}
+
 impl Default for Fabric {
     fn default() -> Self {
         Self::new()
@@ -225,11 +332,19 @@ impl Fabric {
             semi_trusted: Mutex::new(None),
             anchor_pool: Mutex::new(AnchorPool::default()),
             prefer_latest: AtomicBool::new(true),
+            semi_trust_config: Mutex::new(SemiTrustConfig::default()),
         }
     }
 
     pub fn with_dev_mode(mut self) -> Self {
         self.dev_mode = true;
+        self
+    }
+
+    /// Configure the semi-trusted relay pool + quorum at construction. Defaults
+    /// to the built-in bootstrap pool with `Quorum::Majority`.
+    pub fn with_semi_trusted(self, config: SemiTrustConfig) -> Self {
+        *self.semi_trust_config.lock().unwrap() = config;
         self
     }
 
@@ -442,6 +557,95 @@ impl Fabric {
     /// Clear the semi trusted state.
     pub fn clear_semi_trusted(&self) {
         *self.semi_trusted.lock().unwrap() = None;
+    }
+
+    /// The configured semi-trusted pool + quorum. Clients (e.g. a settings UI)
+    /// can read this to display the set, then push edits back with
+    /// [`Fabric::set_semi_trusted_pool`].
+    pub fn semi_trusted_pool(&self) -> SemiTrustConfig {
+        self.semi_trust_config.lock().unwrap().clone()
+    }
+
+    /// Replace the semi-trusted pool + quorum at runtime. Does not itself fetch;
+    /// call [`Fabric::refresh_semi_trusted`] to apply the new pool.
+    pub fn set_semi_trusted_pool(&self, relays: Vec<SemiTrustedRelay>, quorum: Quorum) {
+        *self.semi_trust_config.lock().unwrap() = SemiTrustConfig { relays, quorum };
+    }
+
+    /// Fetch each keyed relay's signed anchor head, verify the `X-Anchor-Sig`
+    /// against its pinned key, and pin the root that meets quorum as the
+    /// semi-trusted anchor.
+    ///
+    /// If quorum is not met (relays down, disagreeing, or none keyed yet), the
+    /// existing semi-trusted anchor is kept untouched — a transient never
+    /// clears a good anchor. The returned [`SemiTrustResult`] reports the vote
+    /// breakdown so callers can surface it.
+    pub async fn refresh_semi_trusted(&self) -> Result<SemiTrustResult> {
+        let config = self.semi_trust_config.lock().unwrap().clone();
+        let total = config.relays.len();
+
+        // Collect a signed vote per relay. A relay that is down or serves a
+        // bad/absent signature simply does not vote.
+        let mut votes: HashMap<[u8; 32], (u32, Vec<String>)> = HashMap::new();
+        let mut verified = 0usize;
+        for relay in &config.relays {
+            if let Ok((root, height)) =
+                fetch_signed_anchor_head(&self.http, &relay.url, &relay.pubkey).await
+            {
+                verified += 1;
+                let entry = votes.entry(root).or_insert((height, Vec::new()));
+                entry.1.push(relay.url.clone());
+            }
+        }
+
+        // Winner: the root the most relays agree on, breaking ties by height.
+        let winner = votes
+            .into_iter()
+            .max_by_key(|(_, (height, urls))| (urls.len(), *height));
+        let required = config.quorum.required(total);
+        let agreed = winner.as_ref().map_or(0, |(_, (_, urls))| urls.len());
+        let quorum_met = agreed > 0 && agreed >= required;
+
+        if quorum_met {
+            let (root, (height, urls)) = winner.expect("agreed > 0 implies a winner");
+            let trust_id = TrustId::from(root);
+            // Fetch the full set from a relay that voted for this root (it
+            // demonstrably serves it) and pin it as the semi-trusted anchor.
+            let ab = fetch_anchor_set(&self.http, trust_id, &urls).await?;
+            self.apply_semi_trusted(ab);
+            Ok(SemiTrustResult {
+                trust_id: Some(trust_id),
+                height: Some(height),
+                total,
+                verified,
+                agreed,
+                required,
+                quorum_met: true,
+            })
+        } else {
+            // Keep whatever anchor we already had.
+            Ok(SemiTrustResult {
+                trust_id: self.semi_trusted(),
+                height: None,
+                total,
+                verified,
+                agreed,
+                required,
+                quorum_met: false,
+            })
+        }
+    }
+
+    /// Pin an already-fetched anchor bundle as the semi-trusted source and
+    /// rebuild the merged Veritas. Shared by the trust-id and pooled paths.
+    fn apply_semi_trusted(&self, ab: AnchorBundle) {
+        let mut pool = self.anchor_pool.lock().unwrap();
+        pool.semi_trusted = ab.anchors;
+        if let Ok(v) = Veritas::new().with_anchors(pool.merged()) {
+            *self.veritas.lock().unwrap() = v;
+        }
+        drop(pool);
+        *self.semi_trusted.lock().unwrap() = Some(ab.trust_set);
     }
 
     /// Set whether to query multiple relays for freshness hints before resolving.
@@ -1427,6 +1631,172 @@ async fn fetch_anchor_set(
     }
 
     Err(last_err.unwrap_or(Error::NoPeers))
+}
+
+/// Domain tag for the relay's anchor-root signature. Must match the relay's
+/// `identity::ANCHOR_SIG_TAG`.
+const ANCHOR_SIG_TAG: &[u8] = b"certrelay-anchor-sig-v1";
+
+/// The domain-tagged payload a relay signs for an `(anchor root, height)`. It is
+/// verified with `verify_spaces_message`, which applies the Spaces prefix +
+/// SHA256 — the same primitive every language binding ships.
+fn anchor_sig_payload(trust_id: &[u8; 32], height: u32) -> Vec<u8> {
+    let mut payload = Vec::with_capacity(ANCHOR_SIG_TAG.len() + 36);
+    payload.extend_from_slice(ANCHOR_SIG_TAG);
+    payload.extend_from_slice(trust_id);
+    payload.extend_from_slice(&height.to_be_bytes());
+    payload
+}
+
+/// Verify a relay's `X-Anchor-Sig` over `(root, height)` against a pinned key.
+fn verify_anchor_sig(root: &[u8; 32], height: u32, sig: &[u8; 64], pubkey: &[u8; 32]) -> bool {
+    libveritas::verify_spaces_message(&anchor_sig_payload(root, height), sig, pubkey).is_ok()
+}
+
+/// Decode a 32-byte x-only public key from hex, rejecting anything that is not
+/// a valid key.
+fn parse_xonly_hex(hex_str: &str) -> Result<[u8; 32]> {
+    let bytes = hex::decode(hex_str.trim())?;
+    let arr: [u8; 32] = bytes.as_slice().try_into().map_err(|_| {
+        Error::Decode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "x-only public key must be 32 bytes",
+        ))
+    })?;
+    secp256k1::XOnlyPublicKey::from_slice(&arr).map_err(|_| {
+        Error::Decode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "invalid x-only public key",
+        ))
+    })?;
+    Ok(arr)
+}
+
+/// HEAD a relay's `/anchors`, read the signed `(root, height)`, and verify the
+/// `X-Anchor-Sig` against the pinned key. Returns the verified `(root, height)`.
+async fn fetch_signed_anchor_head(
+    http: &reqwest::Client,
+    relay_url: &str,
+    pubkey: &[u8; 32],
+) -> Result<([u8; 32], u32)> {
+    let url = format!("{relay_url}/anchors");
+    let resp = http.head(&url).send().await.map_err(|e| {
+        Error::Decode(std::io::Error::new(
+            std::io::ErrorKind::ConnectionRefused,
+            format!("HEAD {url}: {e}"),
+        ))
+    })?;
+    if !resp.status().is_success() {
+        return Err(Error::Relay {
+            status: resp.status().as_u16(),
+            body: format!("HEAD {url}"),
+        });
+    }
+
+    let header = |name: &str| {
+        resp.headers()
+            .get(name)
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string)
+    };
+    let invalid = |msg: &str| {
+        Error::Decode(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            format!("{url}: {msg}"),
+        ))
+    };
+
+    let root_hex = header("x-anchor-root").ok_or_else(|| invalid("missing x-anchor-root"))?;
+    let sig_hex = header("x-anchor-sig").ok_or_else(|| invalid("missing x-anchor-sig"))?;
+    let height: u32 = header("x-anchor-height")
+        .and_then(|s| s.parse().ok())
+        .unwrap_or(0);
+
+    let root: [u8; 32] = hex::decode(&root_hex)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("anchor root must be 32 bytes"))?;
+    let sig: [u8; 64] = hex::decode(&sig_hex)?
+        .as_slice()
+        .try_into()
+        .map_err(|_| invalid("anchor sig must be 64 bytes"))?;
+
+    if !verify_anchor_sig(&root, height, &sig, pubkey) {
+        return Err(invalid("anchor signature did not verify"));
+    }
+    Ok((root, height))
+}
+
+#[cfg(test)]
+mod semi_trust_tests {
+    use super::*;
+
+    /// A fixed keypair standing in for a relay's signing identity.
+    fn test_keypair() -> (secp256k1::Keypair, [u8; 32]) {
+        let secp = secp256k1::Secp256k1::new();
+        let kp = secp256k1::Keypair::from_seckey_slice(&secp, &[7u8; 32]).unwrap();
+        let (xonly, _) = kp.x_only_public_key();
+        (kp, xonly.serialize())
+    }
+
+    /// Sign an (root, height) the way the relay's `identity::sign_anchor` does.
+    fn sign(kp: &secp256k1::Keypair, root: &[u8; 32], height: u32) -> [u8; 64] {
+        let secp = secp256k1::Secp256k1::new();
+        let msg = libveritas::hash_signable_message(&anchor_sig_payload(root, height));
+        secp.sign_schnorr_no_aux_rand(&msg, kp).serialize()
+    }
+
+    #[test]
+    fn quorum_thresholds() {
+        assert_eq!(Quorum::All.required(3), 3);
+        assert_eq!(Quorum::AtLeast(2).required(5), 2);
+        assert_eq!(Quorum::Majority.required(0), 1); // never met with an empty pool
+        assert_eq!(Quorum::Majority.required(1), 1);
+        assert_eq!(Quorum::Majority.required(2), 2);
+        assert_eq!(Quorum::Majority.required(3), 2);
+        assert_eq!(Quorum::Majority.required(4), 3);
+    }
+
+    #[test]
+    fn verify_roundtrips_and_rejects_tampering() {
+        let (kp, pubkey) = test_keypair();
+        let root = [9u8; 32];
+        let height = 944_203u32;
+        let sig = sign(&kp, &root, height);
+
+        assert!(verify_anchor_sig(&root, height, &sig, &pubkey));
+        // Wrong height, wrong root, and wrong key all fail.
+        assert!(!verify_anchor_sig(&root, height + 1, &sig, &pubkey));
+        assert!(!verify_anchor_sig(&[0u8; 32], height, &sig, &pubkey));
+        assert!(!verify_anchor_sig(&root, height, &sig, &[1u8; 32]));
+    }
+
+    #[test]
+    fn from_hex_validates_key() {
+        let (_, pubkey) = test_keypair();
+        let hex_key = hex::encode(pubkey);
+        let relay = SemiTrustedRelay::from_hex("https://r.example", &hex_key).unwrap();
+        assert_eq!(relay.pubkey_hex(), hex_key);
+
+        assert!(SemiTrustedRelay::from_hex("https://r.example", "not-hex").is_err());
+        assert!(SemiTrustedRelay::from_hex("https://r.example", "00").is_err()); // too short
+    }
+
+    #[test]
+    fn default_pool_pins_production_relays() {
+        // The default pool is our production relays with their advertised keys,
+        // under majority quorum. Every pinned key must parse (from_hex would
+        // have panicked in Default otherwise); assert the shape here.
+        let config = SemiTrustConfig::default();
+        assert_eq!(config.relays.len(), SEED_SEMI_TRUSTED.len());
+        assert!(!config.relays.is_empty());
+        assert_eq!(config.quorum, Quorum::Majority);
+        for relay in &config.relays {
+            assert!(relay.url.starts_with("https://"));
+            // pubkey is [u8; 32]; from_hex validated it as a real x-only key.
+            assert_eq!(relay.pubkey_hex().len(), 64);
+        }
+    }
 }
 
 #[cfg(test)]
