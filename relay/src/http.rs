@@ -16,7 +16,10 @@ use axum::{
 use governor::RateLimiter;
 use governor::clock::DefaultClock;
 use governor::state::keyed::DashMapStateStore;
+use libveritas::Zone;
 use libveritas::msg::Message;
+use libveritas::names::Lookup;
+use libveritas::spaces_protocol::sname::SName;
 use tokio::sync::Mutex;
 
 pub use governor::Quota;
@@ -278,6 +281,7 @@ pub fn router(state: Arc<AppState>) -> Router {
         .route("/query", get(handle_query))
         .route("/anchors", get(handle_anchors))
         .route("/hints", get(handle_hints))
+        .route("/peek", get(handle_peek))
         .route("/chain-proof", post(handle_chain_proof))
         .route("/reverse", get(handle_reverse))
         .route("/addrs", get(handle_addrs))
@@ -917,6 +921,99 @@ async fn handle_hints(
             (StatusCode::BAD_REQUEST, e.to_string()).into_response()
         }
     }
+}
+
+/// GET /peek?q=alice@bitcoin,@bitcoin - Cheap, UNVERIFIED zone dump.
+///
+/// Returns the stored zone(s) for one handle as JSON straight from the database,
+/// with no chain-proof verification and no anchor checks.
+///
+/// Takes exactly one handle. Flat names (`@bitcoin`, `#…`, `alice@bitcoin`) are
+/// a single keyed read. One level of nesting (`alice.jay@bitcoin`) is also
+/// supported: the same libveritas name walk clients use is driven against the
+/// DB — resolve `jay@bitcoin` to learn its numeric alias, then read
+/// `alice#<alias>` — and the response includes the parent zone(s) it walked
+/// through. Deeper nesting (`a.b.c@…`) is rejected to keep this cheap.
+///
+/// This is a debugging affordance: the fields (especially `sovereignty`) reflect
+/// only what this relay last stored, which can lag the chain — a normal resolve
+/// re-verifies against spaced, this does not. Handy for spotting stale relays;
+/// do NOT use for trust decisions.
+async fn handle_peek(
+    State(state): State<Arc<AppState>>,
+    ConnectInfo(addr): ConnectInfo<SocketAddr>,
+    headers: HeaderMap,
+    axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
+) -> impl IntoResponse {
+    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    if state.limiters.read.check_key(&ip).is_err() {
+        crate::stats::bump(&state.stats.rl_read);
+        return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
+    }
+
+    let q = match params.get("q") {
+        Some(q) if !q.trim().is_empty() => q.trim(),
+        _ => return (StatusCode::BAD_REQUEST, "missing q parameter").into_response(),
+    };
+
+    // Exactly one handle — this is a single-name debug peek, not a batch API.
+    if q.contains(',') {
+        return (StatusCode::BAD_REQUEST, "peek takes exactly one handle").into_response();
+    }
+    // Dots are the only nesting separator, so the dot count is the nesting
+    // depth. Cap at one level to bound the DB walk (and keep it "cheap").
+    if q.matches('.').count() > 1 {
+        return (
+            StatusCode::BAD_REQUEST,
+            "at most one level of nesting (e.g. alice.jay@bitcoin)",
+        )
+            .into_response();
+    }
+
+    let Ok(sname) = SName::try_from(q) else {
+        return (StatusCode::BAD_REQUEST, "invalid handle").into_response();
+    };
+
+    // Drive libveritas' name lookup against the local DB instead of the network.
+    // Each batch handle's string form is exactly a stored key (the cert subject
+    // / canonical), so a batch is a plain keyed read of unverified zones. For a
+    // one-level name this is two reads (parent, then leaf); flat names are one.
+    let lookup = Lookup::new(vec![sname]);
+    let mut zones: Vec<Zone> = Vec::new();
+    let mut prev: Vec<SName> = Vec::new();
+    let mut batch = lookup.start();
+    // A one-dot name needs two steps; the small cap is a hard backstop on top of
+    // the depth check above.
+    for _ in 0..3 {
+        if batch.is_empty() || batch == prev {
+            break;
+        }
+        let keys: Vec<String> = batch.iter().map(|s| s.to_string()).collect();
+        let refs: Vec<&str> = keys.iter().map(|s| s.as_str()).collect();
+        let batch_zones: Vec<Zone> = match state.handler.store.get_handles(&refs) {
+            Ok(records) => records.into_iter().map(|r| r.zone).collect(),
+            Err(e) => {
+                tracing::warn!("peek failed: {}", e);
+                return (StatusCode::INTERNAL_SERVER_ERROR, "peek failed").into_response();
+            }
+        };
+        prev = batch;
+        batch = lookup.advance(&batch_zones);
+        zones.extend(batch_zones);
+    }
+    // Remap canonical handles back to the human dotted form (e.g. the leaf's
+    // handle becomes `alice.jay@bitcoin`).
+    lookup.expand_zones(&mut zones);
+
+    // Zone derives Serialize (and sip7 records serialize parsed), so this is the
+    // same shape clients see via `zone.toJson()` — just unverified.
+    let json: Vec<serde_json::Value> = zones
+        .iter()
+        .filter_map(|z| serde_json::to_value(z).ok())
+        .collect();
+    let mut headers = HeaderMap::new();
+    headers.insert("cache-control", "public, max-age=5".parse().unwrap());
+    (headers, axum::Json(json)).into_response()
 }
 
 /// GET /reverse?ids=num1,num2,... - Look up reverse records for numeric identities.
