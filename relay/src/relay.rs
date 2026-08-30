@@ -44,6 +44,9 @@ pub struct Config {
     pub peer_config: PeerConfig,
     /// HTTP header to read client IP from (e.g. "x-forwarded-for", "cf-connecting-ip").
     pub remote_ip_header: Option<String>,
+    /// Trusted reverse-proxy networks; when non-empty, the remote-ip header is
+    /// only honored for peers within these ranges. Empty = legacy behavior.
+    pub trusted_proxies: Vec<ipnet::IpNet>,
     /// Accept fake ZK receipts (for testing only).
     pub dev_mode: bool,
     /// Accept peers with private/loopback addresses (local development and tests).
@@ -69,6 +72,7 @@ impl Config {
             max_message_size: DEFAULT_MAX_MESSAGE_SIZE,
             peer_config: PeerConfig::default(),
             remote_ip_header: None,
+            trusted_proxies: Vec::new(),
             dev_mode: false,
             allow_private_peers: false,
             settings: crate::settings::FileConfig::default(),
@@ -151,6 +155,7 @@ impl Relay {
         state.capabilities = config.capabilities;
         state.is_bootstrap = config.is_bootstrap;
         state.remote_ip_header = config.remote_ip_header;
+        state.trusted_proxies = config.trusted_proxies;
         state.allow_private_peers = config.allow_private_peers;
 
         // Load (or generate on first boot) the signing identity. Best-effort:

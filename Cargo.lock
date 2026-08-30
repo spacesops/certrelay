@@ -2763,6 +2763,7 @@ dependencies = [
  "fabric-resolver",
  "governor",
  "hex",
+ "ipnet",
  "libveritas",
  "libveritas_testutil",
  "rand 0.9.4",

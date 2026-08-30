@@ -60,6 +60,19 @@ struct Args {
     #[arg(long, env = "CERTRELAY_REMOTE_IP_HEADER")]
     remote_ip_header: Option<String>,
 
+    /// Trusted reverse-proxy networks (IP or CIDR), repeatable
+    /// (`--trusted-proxy CIDR --trusted-proxy CIDR`) or comma-separated via the
+    /// env var. When set, `--remote-ip-header` is only honored for connections
+    /// from these ranges, so a directly-reachable origin can't be used to spoof
+    /// the header. When empty (default), the header is trusted from any peer —
+    /// unchanged behavior for relays that rely on a CF-only firewall.
+    #[arg(
+        long = "trusted-proxy",
+        env = "CERTRELAY_TRUSTED_PROXIES",
+        value_delimiter = ','
+    )]
+    trusted_proxies: Vec<String>,
+
     /// Anchor refresh interval in seconds (default: 300 = 5 minutes)
     #[arg(long, default_value = "300", env = "CERTRELAY_ANCHOR_REFRESH")]
     anchor_refresh: u64,
@@ -82,6 +95,30 @@ fn default_data_dir() -> PathBuf {
     std::env::var("HOME")
         .map(|h| PathBuf::from(h).join(".certrelay"))
         .unwrap_or_else(|_| PathBuf::from(".certrelay"))
+}
+
+/// Parse `--trusted-proxy` entries (bare IP or CIDR) into networks, logging and
+/// skipping anything malformed so one bad entry can't take the relay down.
+fn parse_trusted_proxies(entries: &[String]) -> Vec<ipnet::IpNet> {
+    entries
+        .iter()
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Ok(net) = s.parse::<ipnet::IpNet>() {
+                return Some(net);
+            }
+            // Accept a bare IP as a host route (/32 or /128).
+            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                return ipnet::IpNet::new(ip, prefix).ok();
+            }
+            tracing::warn!("ignoring invalid --trusted-proxy entry: {s:?}");
+            None
+        })
+        .collect()
 }
 
 pub async fn run(
@@ -201,6 +238,7 @@ pub async fn run(
     config.is_bootstrap = args.is_bootstrap;
     config.self_url = args.self_url;
     config.remote_ip_header = args.remote_ip_header;
+    config.trusted_proxies = parse_trusted_proxies(&args.trusted_proxies);
     config.allow_private_peers = args.allow_private_peers;
     config.peer_config = settings.peer_config();
     config.settings = settings;
