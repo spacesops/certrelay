@@ -47,6 +47,8 @@ pub struct Config {
     /// Trusted reverse-proxy networks; when non-empty, the remote-ip header is
     /// only honored for peers within these ranges. Empty = legacy behavior.
     pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Client IPs exempt from all rate limits. Empty = everyone is limited.
+    pub rate_limit_allowlist: std::collections::HashSet<std::net::IpAddr>,
     /// Accept fake ZK receipts (for testing only).
     pub dev_mode: bool,
     /// Accept peers with private/loopback addresses (local development and tests).
@@ -73,6 +75,7 @@ impl Config {
             peer_config: PeerConfig::default(),
             remote_ip_header: None,
             trusted_proxies: Vec::new(),
+            rate_limit_allowlist: std::collections::HashSet::new(),
             dev_mode: false,
             allow_private_peers: false,
             settings: crate::settings::FileConfig::default(),
@@ -156,6 +159,7 @@ impl Relay {
         state.is_bootstrap = config.is_bootstrap;
         state.remote_ip_header = config.remote_ip_header;
         state.trusted_proxies = config.trusted_proxies;
+        state.rate_limit_allowlist = config.rate_limit_allowlist;
         state.allow_private_peers = config.allow_private_peers;
 
         // Load (or generate on first boot) the signing identity. Best-effort:

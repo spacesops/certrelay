@@ -73,6 +73,17 @@ struct Args {
     )]
     trusted_proxies: Vec<String>,
 
+    /// Client IPs exempt from all rate limits (trusted infra, monitoring),
+    /// repeatable or comma-separated via the env var. Matched against the
+    /// resolved client IP, so pair with `--trusted-proxy` behind a proxy to keep
+    /// it spoof-resistant. Empty (default) = everyone is rate-limited.
+    #[arg(
+        long = "rate-limit-allow",
+        env = "CERTRELAY_RATE_LIMIT_ALLOW",
+        value_delimiter = ','
+    )]
+    rate_limit_allow: Vec<String>,
+
     /// Anchor refresh interval in seconds (default: 300 = 5 minutes)
     #[arg(long, default_value = "300", env = "CERTRELAY_ANCHOR_REFRESH")]
     anchor_refresh: u64,
@@ -117,6 +128,27 @@ fn parse_trusted_proxies(entries: &[String]) -> Vec<ipnet::IpNet> {
             }
             tracing::warn!("ignoring invalid --trusted-proxy entry: {s:?}");
             None
+        })
+        .collect()
+}
+
+/// Parse `--rate-limit-allow` entries into exact IPs, logging and skipping
+/// anything malformed.
+fn parse_allowlist(entries: &[String]) -> std::collections::HashSet<std::net::IpAddr> {
+    entries
+        .iter()
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    tracing::warn!("ignoring invalid --rate-limit-allow entry: {s:?}");
+                    None
+                }
+            }
         })
         .collect()
 }
@@ -239,6 +271,7 @@ pub async fn run(
     config.self_url = args.self_url;
     config.remote_ip_header = args.remote_ip_header;
     config.trusted_proxies = parse_trusted_proxies(&args.trusted_proxies);
+    config.rate_limit_allowlist = parse_allowlist(&args.rate_limit_allow);
     config.allow_private_peers = args.allow_private_peers;
     config.peer_config = settings.peer_config();
     config.settings = settings;
