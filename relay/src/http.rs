@@ -1084,7 +1084,7 @@ async fn handle_peek(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    let ip = state.client_ip(&addr, &headers);
     if state.limiters.read.check_key(&ip).is_err() {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
