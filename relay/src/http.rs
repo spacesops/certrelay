@@ -149,6 +149,15 @@ pub struct AppState {
     /// HTTP header to read the client IP from (e.g. "x-forwarded-for", "cf-connecting-ip").
     /// If None, uses the socket address directly.
     pub remote_ip_header: Option<String>,
+    /// Trusted reverse-proxy networks. When non-empty, `remote_ip_header` is
+    /// only honored for connections whose socket peer falls in one of these
+    /// ranges (the reverse-proxy model). Empty keeps the legacy behavior: the
+    /// header is trusted from any peer (relies on an external CF-only firewall).
+    pub trusted_proxies: Vec<ipnet::IpNet>,
+    /// Client IPs exempt from all rate limits (trusted infra, monitoring). Match
+    /// is against the resolved client IP, so it inherits `trusted_proxies`
+    /// spoof-resistance. Empty = everyone is limited.
+    pub rate_limit_allowlist: std::collections::HashSet<IpAddr>,
     /// Accept peers with private/loopback addresses (local development and tests).
     pub allow_private_peers: bool,
     /// Signal that new data was stored — wakes the poke-send loop, which
@@ -206,6 +215,8 @@ impl AppState {
             capabilities: 0,
             is_bootstrap: false,
             remote_ip_header: None,
+            trusted_proxies: Vec::new(),
+            rate_limit_allowlist: std::collections::HashSet::new(),
             allow_private_peers: false,
             poke_dirty: tokio::sync::Notify::new(),
             poke_sync_tx,
@@ -310,23 +321,151 @@ async fn version_header(
     resp
 }
 
-/// Extract the client IP from the configured header, falling back to socket address.
-///
-/// If `remote_ip_header` is set, reads that header and parses the **last** IP.
-/// For append-style headers (X-Forwarded-For) the rightmost entry is the one
-/// written by our own trusted proxy — leftmost entries are client-controlled
-/// and would let anyone rotate fake IPs past the per-IP limits. Single-value
-/// overwrite headers (CF-Connecting-IP) are unaffected.
-fn client_ip(addr: &SocketAddr, headers: &HeaderMap, header_name: &Option<String>) -> IpAddr {
-    if let Some(name) = header_name
-        && let Some(value) = headers.get(name.as_str()).and_then(|v| v.to_str().ok())
-    {
-        let last = value.rsplit(',').next().unwrap_or("").trim();
-        if let Ok(ip) = last.parse::<IpAddr>() {
-            return ip;
+impl AppState {
+    /// Extract the client IP from the configured header, falling back to the
+    /// socket address.
+    ///
+    /// If `remote_ip_header` is set, reads that header and parses the **last**
+    /// IP. For append-style headers (X-Forwarded-For) the rightmost entry is the
+    /// one written by our own trusted proxy — leftmost entries are
+    /// client-controlled and would let anyone rotate fake IPs past the per-IP
+    /// limits. Single-value overwrite headers (CF-Connecting-IP) are unaffected.
+    ///
+    /// When `trusted_proxies` is non-empty, the header is only honored if the
+    /// socket peer is within a trusted range — otherwise a directly-reachable
+    /// origin would let anyone spoof the header. When it's empty (the default),
+    /// the header is honored from any peer, preserving the prior behavior for
+    /// deployments that rely on an external CF-only firewall.
+    fn client_ip(&self, addr: &SocketAddr, headers: &HeaderMap) -> IpAddr {
+        resolve_client_ip(addr, headers, &self.remote_ip_header, &self.trusted_proxies)
+    }
+
+    /// Whether `ip` should be rejected for exceeding `limiter`. Allow-listed IPs
+    /// are never limited (and never consume a token, so they can't be starved).
+    fn over_limit(&self, limiter: &IpRateLimiter, ip: &IpAddr) -> bool {
+        is_rate_limited(&self.rate_limit_allowlist, limiter, ip)
+    }
+}
+
+/// Rate-limit decision, factored out of [`AppState::over_limit`] for testing.
+/// Short-circuits on the allow-list *before* touching the limiter, so an
+/// allow-listed IP never consumes a token.
+fn is_rate_limited(
+    allowlist: &std::collections::HashSet<IpAddr>,
+    limiter: &IpRateLimiter,
+    ip: &IpAddr,
+) -> bool {
+    !allowlist.contains(ip) && limiter.check_key(ip).is_err()
+}
+
+/// The client-IP resolution logic, factored out of [`AppState::client_ip`] so it
+/// can be unit-tested without constructing a full `AppState`.
+fn resolve_client_ip(
+    addr: &SocketAddr,
+    headers: &HeaderMap,
+    remote_ip_header: &Option<String>,
+    trusted_proxies: &[ipnet::IpNet],
+) -> IpAddr {
+    if let Some(name) = remote_ip_header {
+        let peer_trusted = trusted_proxies.is_empty()
+            || trusted_proxies.iter().any(|net| net.contains(&addr.ip()));
+        if peer_trusted
+            && let Some(value) = headers.get(name.as_str()).and_then(|v| v.to_str().ok())
+        {
+            let last = value.rsplit(',').next().unwrap_or("").trim();
+            if let Ok(ip) = last.parse::<IpAddr>() {
+                return ip;
+            }
         }
     }
     addr.ip()
+}
+
+#[cfg(test)]
+mod client_ip_tests {
+    use super::*;
+
+    fn hdr(name: &str, value: &str) -> HeaderMap {
+        let mut h = HeaderMap::new();
+        let name = axum::http::HeaderName::from_bytes(name.as_bytes()).unwrap();
+        h.insert(name, value.parse().unwrap());
+        h
+    }
+    fn sock(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+    fn nets(cidrs: &[&str]) -> Vec<ipnet::IpNet> {
+        cidrs.iter().map(|c| c.parse().unwrap()).collect()
+    }
+
+    #[test]
+    fn no_header_configured_uses_socket() {
+        let ip = resolve_client_ip(
+            &sock("203.0.113.9"),
+            &hdr("cf-connecting-ip", "1.2.3.4"),
+            &None,
+            &[],
+        );
+        assert_eq!(ip.to_string(), "203.0.113.9");
+    }
+
+    #[test]
+    fn legacy_no_trusted_proxies_honors_header_from_anyone() {
+        // Empty trusted list = unchanged behavior: trust the header regardless
+        // of the socket peer.
+        let ip = resolve_client_ip(
+            &sock("203.0.113.9"),
+            &hdr("cf-connecting-ip", "1.2.3.4"),
+            &Some("cf-connecting-ip".into()),
+            &[],
+        );
+        assert_eq!(ip.to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn trusted_peer_honors_header() {
+        let ip = resolve_client_ip(
+            &sock("173.245.48.7"),
+            &hdr("cf-connecting-ip", "1.2.3.4"),
+            &Some("cf-connecting-ip".into()),
+            &nets(&["173.245.48.0/20"]),
+        );
+        assert_eq!(ip.to_string(), "1.2.3.4");
+    }
+
+    #[test]
+    fn untrusted_peer_ignores_header_and_uses_socket() {
+        // A direct connection (not from a trusted proxy) can't spoof the header.
+        let ip = resolve_client_ip(
+            &sock("203.0.113.9"),
+            &hdr("cf-connecting-ip", "1.2.3.4"),
+            &Some("cf-connecting-ip".into()),
+            &nets(&["173.245.48.0/20"]),
+        );
+        assert_eq!(ip.to_string(), "203.0.113.9");
+    }
+
+    #[test]
+    fn allowlisted_ip_bypasses_exhausted_limiter() {
+        let limiter = RateLimiter::dashmap(Quota::per_minute(NonZeroU32::new(1).unwrap()));
+        let allowed: IpAddr = "10.0.0.1".parse().unwrap();
+        let other: IpAddr = "10.0.0.2".parse().unwrap();
+        let allowlist: std::collections::HashSet<IpAddr> = [allowed].into_iter().collect();
+
+        // A non-allow-listed IP burns its single token, then is limited.
+        assert!(!is_rate_limited(&allowlist, &limiter, &other));
+        assert!(is_rate_limited(&allowlist, &limiter, &other));
+
+        // The allow-listed IP is never limited, even repeatedly — and never
+        // consumes a token (short-circuits before the limiter).
+        for _ in 0..5 {
+            assert!(!is_rate_limited(&allowlist, &limiter, &allowed));
+        }
+
+        // Empty allow-list = everyone limited (baseline).
+        let empty = std::collections::HashSet::new();
+        assert!(is_rate_limited(&empty, &limiter, &other));
+    }
 }
 
 /// POST /message - Receive and process a certificate message.
@@ -340,9 +479,9 @@ async fn handle_message(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    let ip = state.client_ip(&addr, &headers);
     crate::stats::bump(&state.stats.messages_received);
-    if state.limiters.message.check_key(&ip).is_err() {
+    if state.over_limit(&state.limiters.message, &ip) {
         crate::stats::bump(&state.stats.rl_message);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited".to_string());
     }
@@ -433,8 +572,8 @@ async fn handle_stats(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -481,8 +620,8 @@ async fn handle_poke(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.poke.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.poke, &ip) {
         crate::stats::bump(&state.stats.rl_poke);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited");
     }
@@ -536,8 +675,8 @@ async fn handle_announce(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.announce.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.announce, &ip) {
         crate::stats::bump(&state.stats.rl_announce);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited");
     }
@@ -586,8 +725,8 @@ async fn handle_peers(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -651,11 +790,11 @@ async fn handle_query(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
+    let ip = state.client_ip(&addr, &headers);
     // Cheap read gate covers every /query — including conditional 304s and the
     // zone-hash lookup below. Proof generation has its own stricter gate,
     // charged only on a cache miss just before the proof is built.
-    if state.limiters.read.check_key(&ip).is_err() {
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
@@ -773,7 +912,7 @@ async fn handle_query(
 
     // Cache miss: this request will generate a proof, so charge the stricter
     // proof budget now (304s and cache hits above never reach here).
-    if state.limiters.proof.check_key(&ip).is_err() {
+    if state.over_limit(&state.limiters.proof, &ip) {
         crate::stats::bump(&state.stats.rl_proof);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
@@ -809,8 +948,8 @@ async fn handle_anchors(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -885,8 +1024,8 @@ async fn handle_hints(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -1025,8 +1164,8 @@ async fn handle_reverse(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -1067,8 +1206,8 @@ async fn handle_addrs(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.read.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.read, &ip) {
         crate::stats::bump(&state.stats.rl_read);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -1118,8 +1257,8 @@ async fn handle_sync(
     headers: HeaderMap,
     axum::extract::Query(params): axum::extract::Query<HashMap<String, String>>,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.sync.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.sync, &ip) {
         crate::stats::bump(&state.stats.rl_sync);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
@@ -1169,8 +1308,8 @@ async fn handle_sync_summary(
     ConnectInfo(addr): ConnectInfo<SocketAddr>,
     headers: HeaderMap,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.sync.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.sync, &ip) {
         crate::stats::bump(&state.stats.rl_sync);
         return (StatusCode::TOO_MANY_REQUESTS, "rate limited").into_response();
     }
@@ -1194,8 +1333,8 @@ async fn handle_chain_proof(
     headers: HeaderMap,
     body: Bytes,
 ) -> impl IntoResponse {
-    let ip = client_ip(&addr, &headers, &state.remote_ip_header);
-    if state.limiters.proof.check_key(&ip).is_err() {
+    let ip = state.client_ip(&addr, &headers);
+    if state.over_limit(&state.limiters.proof, &ip) {
         crate::stats::bump(&state.stats.rl_proof);
         return (StatusCode::TOO_MANY_REQUESTS, vec![]).into_response();
     }
