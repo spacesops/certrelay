@@ -60,6 +60,30 @@ struct Args {
     #[arg(long, env = "CERTRELAY_REMOTE_IP_HEADER")]
     remote_ip_header: Option<String>,
 
+    /// Trusted reverse-proxy networks (IP or CIDR), repeatable
+    /// (`--trusted-proxy CIDR --trusted-proxy CIDR`) or comma-separated via the
+    /// env var. When set, `--remote-ip-header` is only honored for connections
+    /// from these ranges, so a directly-reachable origin can't be used to spoof
+    /// the header. When empty (default), the header is trusted from any peer —
+    /// unchanged behavior for relays that rely on a CF-only firewall.
+    #[arg(
+        long = "trusted-proxy",
+        env = "CERTRELAY_TRUSTED_PROXIES",
+        value_delimiter = ','
+    )]
+    trusted_proxies: Vec<String>,
+
+    /// Client IPs exempt from all rate limits (trusted infra, monitoring),
+    /// repeatable or comma-separated via the env var. Matched against the
+    /// resolved client IP, so pair with `--trusted-proxy` behind a proxy to keep
+    /// it spoof-resistant. Empty (default) = everyone is rate-limited.
+    #[arg(
+        long = "rate-limit-allow",
+        env = "CERTRELAY_RATE_LIMIT_ALLOW",
+        value_delimiter = ','
+    )]
+    rate_limit_allow: Vec<String>,
+
     /// Anchor refresh interval in seconds (default: 300 = 5 minutes)
     #[arg(long, default_value = "300", env = "CERTRELAY_ANCHOR_REFRESH")]
     anchor_refresh: u64,
@@ -99,6 +123,51 @@ fn redact_url(url: &str) -> String {
     url.to_string()
 }
 
+/// Parse `--trusted-proxy` entries (bare IP or CIDR) into networks, logging and
+/// skipping anything malformed so one bad entry can't take the relay down.
+fn parse_trusted_proxies(entries: &[String]) -> Vec<ipnet::IpNet> {
+    entries
+        .iter()
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            if let Ok(net) = s.parse::<ipnet::IpNet>() {
+                return Some(net);
+            }
+            // Accept a bare IP as a host route (/32 or /128).
+            if let Ok(ip) = s.parse::<std::net::IpAddr>() {
+                let prefix = if ip.is_ipv4() { 32 } else { 128 };
+                return ipnet::IpNet::new(ip, prefix).ok();
+            }
+            tracing::warn!("ignoring invalid --trusted-proxy entry: {s:?}");
+            None
+        })
+        .collect()
+}
+
+/// Parse `--rate-limit-allow` entries into exact IPs, logging and skipping
+/// anything malformed.
+fn parse_allowlist(entries: &[String]) -> std::collections::HashSet<std::net::IpAddr> {
+    entries
+        .iter()
+        .filter_map(|s| {
+            let s = s.trim();
+            if s.is_empty() {
+                return None;
+            }
+            match s.parse::<std::net::IpAddr>() {
+                Ok(ip) => Some(ip),
+                Err(_) => {
+                    tracing::warn!("ignoring invalid --rate-limit-allow entry: {s:?}");
+                    None
+                }
+            }
+        })
+        .collect()
+}
+
 /// Print every `CERTRELAY_*`-backed setting that this process will use,
 /// alongside the effective values after defaults have been applied. Written
 /// to stderr with `eprintln!` so it's visible regardless of `RUST_LOG` /
@@ -127,6 +196,22 @@ fn log_startup_env(args: &Args, data_dir: &Path) {
     eprintln!(
         "  CERTRELAY_REMOTE_IP_HEADER = {}",
         args.remote_ip_header.as_deref().unwrap_or("<unset>")
+    );
+    eprintln!(
+        "  CERTRELAY_TRUSTED_PROXIES  = {}",
+        if args.trusted_proxies.is_empty() {
+            "<unset>".to_string()
+        } else {
+            args.trusted_proxies.join(",")
+        }
+    );
+    eprintln!(
+        "  CERTRELAY_RATE_LIMIT_ALLOW = {}",
+        if args.rate_limit_allow.is_empty() {
+            "<unset>".to_string()
+        } else {
+            args.rate_limit_allow.join(",")
+        }
     );
     eprintln!("  CERTRELAY_BOOTSTRAP        = {}", args.is_bootstrap);
     eprintln!(
@@ -285,6 +370,8 @@ pub async fn run(
     config.is_bootstrap = args.is_bootstrap;
     config.self_url = args.self_url;
     config.remote_ip_header = args.remote_ip_header;
+    config.trusted_proxies = parse_trusted_proxies(&args.trusted_proxies);
+    config.rate_limit_allowlist = parse_allowlist(&args.rate_limit_allow);
     config.allow_private_peers = args.allow_private_peers;
     config.peer_config = settings.peer_config();
     config.settings = settings;

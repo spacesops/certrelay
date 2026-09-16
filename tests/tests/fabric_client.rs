@@ -258,3 +258,108 @@ async fn test_broadcast_then_resolve() {
         .expect("should resolve all after broadcast");
     assert!(zones.len() >= 2, "should have at least 2 zones");
 }
+
+#[tokio::test(flavor = "multi_thread")]
+async fn test_peek_dumps_stored_zones() {
+    let mut state = ChainState::new();
+    let mut runner = FixtureRunner::new(&mut state, single_commit_finalized());
+    runner.run(&mut state);
+
+    let (url, _) = start_relay(&state).await;
+
+    // Store data.
+    let bundle = runner.build_bundle();
+    let msg = state.message(vec![bundle]);
+    let client = reqwest::Client::new();
+    let resp = client
+        .post(format!("{}/message", url))
+        .body(msg.to_bytes())
+        .header("content-type", "application/octet-stream")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(resp.status().as_u16(), 200);
+
+    // Peek the space root — one handle, unverified dump straight from the DB.
+    let zones: Vec<serde_json::Value> = client
+        .get(format!("{}/peek?q=@sovereign", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    let root = zones
+        .iter()
+        .find(|z| z["handle"] == "@sovereign")
+        .expect("@sovereign should be in the dump");
+    // Fields a UI needs, parsed straight from the stored zone (unverified).
+    assert_eq!(root["sovereignty"], "sovereign");
+    assert!(root["script_pubkey"].as_str().is_some());
+    assert!(root["records"].is_array());
+    assert!(root.get("commitment").is_some());
+
+    // A first-level sub-handle resolves in one keyed read.
+    let zones: Vec<serde_json::Value> = client
+        .get(format!("{}/peek?q=alice@sovereign", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        zones.iter().any(|z| z["handle"] == "alice@sovereign"),
+        "alice@sovereign should be in the dump, got {zones:?}"
+    );
+
+    // A handle that isn't stored → empty array (not an error).
+    let zones: Vec<serde_json::Value> = client
+        .get(format!("{}/peek?q=ghost@sovereign", url))
+        .send()
+        .await
+        .unwrap()
+        .json()
+        .await
+        .unwrap();
+    assert!(
+        zones.is_empty(),
+        "missing handle should return [], got {zones:?}"
+    );
+
+    // Guardrails: missing q, more than one handle, and deeper-than-one nesting
+    // are all 400s.
+    for (path, why) in [
+        ("/peek", "missing q"),
+        (
+            "/peek?q=@sovereign,alice@sovereign",
+            "comma / multiple handles",
+        ),
+        ("/peek?q=a.b.c@sovereign", "two levels of nesting"),
+    ] {
+        let status = client
+            .get(format!("{}{}", url, path))
+            .send()
+            .await
+            .unwrap()
+            .status()
+            .as_u16();
+        assert_eq!(status, 400, "{why} should be a 400");
+    }
+}
+
+/// The nested `/peek` path drives libveritas' `Lookup` against the DB and relies
+/// on each batch handle's string form being exactly a stored key. Pin that
+/// contract: a one-level name's first batch is the flat parent sub-handle
+/// (`genesis@key`), which is a keyed read — not the raw dotted name. (The
+/// subsequent alias walk is covered by libveritas' own Lookup tests.)
+#[test]
+fn peek_nested_first_batch_is_a_flat_key() {
+    use libveritas::names::Lookup;
+    use libveritas::spaces_protocol::sname::SName;
+
+    let sname = SName::try_from("across-remove-super.genesis@key").unwrap();
+    let lookup = Lookup::new(vec![sname]);
+    let batch: Vec<String> = lookup.start().iter().map(|s| s.to_string()).collect();
+    assert_eq!(batch, vec!["genesis@key".to_string()]);
+}
