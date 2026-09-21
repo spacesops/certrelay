@@ -49,7 +49,10 @@ impl SpacedClient {
             return Ok(p.clone());
         }
 
-        let res = self.client.build_chain_proof(req.clone(), None).await?;
+        let res = self
+            .client
+            .build_chain_proof(req.clone(), None, Some(true))
+            .await?;
         Ok(ChainProof {
             anchor: res.block,
             spaces: SpacesSubtree(SubTree::from_slice(&res.spaces_proof)?),
