@@ -3,7 +3,7 @@ resolver = "2"
 members = ["fabric", "relay", "tests"]
 
 [workspace.package]
-version = "0.2.10"
+version = "0.2.11"
 edition = "2024"
 rust-version = "1.85"
 license = "MIT"
@@ -12,12 +12,12 @@ homepage = "https://spacesprotocol.org"
 authors = ["Buffrr <contact@buffrr.dev>"]
 
 [workspace.dependencies]
-fabric-resolver = { path = "fabric", version = "0.2.10" }
-libveritas = { version = "0.4.4" }
-libveritas_testutil = { version = "0.4.4" }
+fabric-resolver = { path = "fabric", version = "0.2.11" }
+libveritas = { version = "0.4.5" }
+libveritas_testutil = { version = "0.4.5" }
 
-spaces_client = { version = "0.4.2" }
-spaces_protocol = { version = "0.4.2" }
-spaces_nums = { version = "0.4.2" }
-spaces_checkpoint = { version = "0.4.2" }
+spaces_client = { version = "0.5.0" }
+spaces_protocol = { version = "0.5.0" }
+spaces_nums = { version = "0.5.0" }
+spaces_checkpoint = { version = "0.5.0" }
 spacedb = { version = "0.1", features = ["hash-idx"] }
